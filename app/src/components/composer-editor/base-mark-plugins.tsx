@@ -306,14 +306,20 @@ const ClearFormattingButton = ({ editor, className }: any) => {
 
     const marks = new Map<string, any>();
     document.getTextsAtRange(selection).forEach((node) => {
-      node.getMarks().forEach((mark) => marks.set(mark.type + JSON.stringify(mark.data.toJS()), mark));
+      node
+        .getMarks()
+        .forEach((mark) => marks.set(mark.type + JSON.stringify(mark.data.toJS()), mark));
     });
     marks.forEach((mark) => editor.removeMark(mark));
     editor.focus();
   };
 
   return (
-    <button className={className} onMouseDown={clearFormatting} title={localized('Clear Formatting')}>
+    <button
+      className={className}
+      onMouseDown={clearFormatting}
+      title={localized('Clear Formatting')}
+    >
       <i className="fa fa-eraser" />
     </button>
   );
