@@ -41,8 +41,7 @@ mousetrap.prototype.stopCallback = (e: KeyboardEvent, element: HTMLElement, comb
   // Let the focused editor or text field handle undo/redo rather than
   // dispatching a global command that can affect a different compose field.
   const target = e.target as HTMLElement;
-  const editingField =
-    target.isContentEditable || ['INPUT', 'TEXTAREA'].includes(target.tagName);
+  const editingField = target.isContentEditable || ['INPUT', 'TEXTAREA'].includes(target.tagName);
   if (editingField && /^(mod|command|ctrl)\+(shift\+)?(z|y)$/.test(combo)) {
     return true;
   }
