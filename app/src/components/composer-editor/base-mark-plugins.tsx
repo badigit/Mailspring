@@ -10,6 +10,7 @@ import {
 } from './toolbar-component-factories';
 
 import BaseBlockPlugins from './base-block-plugins';
+import { LINK_TYPE } from './link-plugins';
 import { ComposerEditorPlugin, Rule } from './types';
 
 export const DEFAULT_FONT_SIZE = 2;
@@ -298,20 +299,17 @@ const rules: Rule[] = [
   },
 ];
 
+export function clearTextFormatting(editor: Editor) {
+  editor.value.marks
+    .filter((mark) => mark.type !== LINK_TYPE)
+    .forEach((mark) => editor.removeMark(mark));
+  editor.focus();
+}
+
 const ClearFormattingButton = ({ editor, className }: any) => {
   const clearFormatting = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
-    const { selection, document } = editor.value;
-    if (selection.isCollapsed) return;
-
-    const marks = new Map<string, any>();
-    document.getTextsAtRange(selection).forEach((node) => {
-      node
-        .getMarks()
-        .forEach((mark) => marks.set(mark.type + JSON.stringify(mark.data.toJS()), mark));
-    });
-    marks.forEach((mark) => editor.removeMark(mark));
-    editor.focus();
+    clearTextFormatting(editor);
   };
 
   return (
@@ -326,6 +324,21 @@ const ClearFormattingButton = ({ editor, className }: any) => {
 };
 
 const BaseMarkPlugin: ComposerEditorPlugin = {
+  onKeyDown: (event, editor, next) => {
+    // Slate's Windows keymap only handles Ctrl+Y. Consume the shifted shortcut
+    // before Chromium redoes an edit in another field in the same frame.
+    if (
+      event.ctrlKey &&
+      event.shiftKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      event.key.toLowerCase() === 'z'
+    ) {
+      event.preventDefault();
+      return editor.redo();
+    }
+    return next();
+  },
   toolbarComponents: []
     .concat(
       Object.values(MARK_CONFIG)
