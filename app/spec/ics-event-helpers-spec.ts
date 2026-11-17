@@ -940,6 +940,20 @@ describe('ICSEventHelpers.addExclusionDate', function () {
 // ---------------------------------------------------------------------------
 
 describe('ICSEventHelpers.updateRecurringEventTimes', function () {
+  it("moves a moved occurrence's RECURRENCE-ID with the series, leaving its own times", function () {
+    const result = ICSEventHelpers.updateRecurringEventTimes(
+      RECURRING_WITH_EXCEPTION_ICS,
+      T_OCC2_START,
+      T_NEW_START,
+      T_NEW_END,
+      false
+    );
+
+    expect(result).toContain('RECURRENCE-ID:20260302T080000Z');
+    expect(result).toContain('DTSTART:20260302T080000Z');
+    expect(result).toContain('DTSTART:20260301T080000Z');
+  });
+
   it('shifts the master DTSTART by the delta (not to an absolute new time)', function () {
     // originalOccurrenceStart is the 2nd occurrence: 2026-03-02T06:00Z
     // newStart is 2026-03-02T08:00Z → delta = +2h
@@ -1351,6 +1365,18 @@ describe('ICSEventHelpers.expansionIterationBudget', function () {
     const daily = budgetFor('FREQ=DAILY');
     expect(daily).toBeGreaterThan(Math.ceil((NOW - START) / DAY));
     expect(daily).toBeGreaterThan(budgetFor('FREQ=WEEKLY;BYDAY=TU'));
+  });
+
+  it('counts every occurrence a period of the rule yields', function () {
+    // Weekdays since 2022 are about 1,170 occurrences, past a floor that one step a week
+    // would never leave.
+    const weeks = Math.ceil((NOW - START) / WEEK);
+    expect(budgetFor('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR')).toBe(weeks * 5 + 100);
+    // A weekday without an ordinal matches up to five weeks of a month; with one, a single day.
+    const longAgo = START - 40 * 365 * DAY;
+    const months = Math.ceil((NOW - longAgo) / (28 * DAY));
+    expect(budgetFor('FREQ=MONTHLY;BYDAY=MO,WE', longAgo)).toBe(months * 10 + 100);
+    expect(budgetFor('FREQ=MONTHLY;BYDAY=1MO,3MO', longAgo)).toBe(months * 2 + 100);
   });
 
   it('returns the floor when the series has no usable start', function () {

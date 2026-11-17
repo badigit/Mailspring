@@ -8,6 +8,7 @@ import { webFrame } from 'electron';
 import * as Actions from '../actions';
 import MailspringStore from 'mailspring-store';
 import { Disposable } from 'event-kit';
+import { IMenuItem } from '../../menu-helpers';
 
 let Sheet = {} as SheetSet;
 let Location = {};
@@ -50,6 +51,8 @@ export interface SheetDeclaration {
   sidebarComponent: any;
   /** The Back button's label on sheets pushed over this one; defaults to the mailbox name. */
   backTitle?: () => string;
+  /** A root sheet's menu, shown in place of Thread and View while it's the root. */
+  menu?: IMenuItem;
 
   Toolbar: SheetToolbarDeclaration;
   Header: { id: string };
@@ -104,6 +107,7 @@ class WorkspaceStore extends MailspringStore {
 
     if (AppEnv.isMainWindow()) {
       this._rebuildShortcuts();
+      this.listen(() => AppEnv.menu.setSectionMenu(this.rootSheet().menu || null));
     }
   }
 
@@ -297,9 +301,15 @@ class WorkspaceStore extends MailspringStore {
     return this._sheetStack[0];
   }
 
-  /** Asked before another section is shown; returning false keeps the current one. */
-  setSectionLeaveGuard(guard: (() => boolean) | null) {
+  /**
+   * Asked before another section is shown; returning false keeps the current one. The returned
+   * function removes it, unless another section's guard has replaced it since.
+   */
+  setSectionLeaveGuard(guard: () => boolean) {
     this._sectionLeaveGuard = guard;
+    return () => {
+      if (this._sectionLeaveGuard === guard) this._sectionLeaveGuard = null;
+    };
   }
 
   _mayLeaveSectionFor(sheet: SheetDeclaration) {
@@ -368,6 +378,7 @@ class WorkspaceStore extends MailspringStore {
       root: options.root,
       sidebarComponent: options.sidebarComponent,
       backTitle: options.backTitle,
+      menu: options.menu,
 
       Toolbar: {
         Left: { id: `Sheet:${id}:Toolbar:Left` },

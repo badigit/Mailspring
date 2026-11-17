@@ -7,23 +7,39 @@ import {
   InjectedComponentSet,
   SnapScroller,
   SnapScrollTarget,
+  withSmallMeridiem,
 } from 'mailspring-component-kit';
-import { CalendarDate, CalendarDateUtils } from 'mailspring-exports';
+import { CalendarDate, CalendarDateUtils, localized } from 'mailspring-exports';
 import CalendarHeaderStore from './calendar-header-store';
 import VisibleRangeStore from './visible-range-store';
-import { EventOccurrence, EventRangeSubscription, isTimed } from './calendar-data-source';
-import { centerGridScroll, dateOf, formatShortTime, momentOf } from './calendar-helpers';
+import {
+  EventOccurrence,
+  EventRangeSubscription,
+  eventCoversDate,
+  inAllDayRow,
+  isTimed,
+} from './calendar-data-source';
+import {
+  DayPlacement,
+  centerGridScroll,
+  dateOf,
+  formatShortTime,
+  momentOf,
+} from './calendar-helpers';
 import { EventGridBackground } from './event-grid-background';
 import { WeekViewEventColumn } from './week-view-event-column';
 import { WeekViewAllDayEvents } from './week-view-all-day-events';
 import { CalendarEventContainer } from './calendar-event-container';
 import { CurrentTimeIndicator, CurrentTimeLabel, EachMinute } from './current-time-indicator';
-import { CalendarView } from './calendar-constants';
+import { BAR_HEIGHT, CalendarView, EVENT_GAP } from './calendar-constants';
 import {
   overlapForEvents,
-  maxConcurrentEvents,
+  columnSpan,
+  DAY_DUR,
+  drawnInGrid,
   eventsGroupedByDay,
   exclusiveDayEnds,
+  TICK_STEP,
   TICKS_PER_DAY,
   tickGenerator,
   dayFraction,
@@ -33,11 +49,12 @@ import { getEventsWithDragPreview, withNewEventPreview } from './calendar-drag-u
 import { withUnsentChange } from './unsent-change';
 import { WeekdayHeader } from './weekday-header';
 
-const MIN_INTERVAL_HEIGHT = 21;
+const ALL_DAY_LANE_HEIGHT = BAR_HEIGHT + EVENT_GAP;
+// Half an hour at its smallest: a 30-minute event holds one 14px line, a 45-minute one two.
+const MIN_INTERVAL_HEIGHT = 24;
 const DATE_LABELS_HEIGHT = 28;
 // Half the current-time pill plus half an hour label: nearer than this, the two overlap.
 const CURRENT_TIME_LABEL_CLEARANCE = 14;
-const DAY_PORTION_SHOWN_VERTICALLY = 14 / 24;
 const QUERY_MARGIN_DAYS = 21;
 
 function weekStartOf(date: CalendarDate): CalendarDate {
@@ -66,11 +83,12 @@ interface TimeGridViewProps extends MailspringCalendarViewProps {
 
 interface TimeGridViewState {
   events: EventOccurrence[];
-  intervalHeight: number;
   firstVisible: CalendarDate;
   scrollTarget: SnapScrollTarget;
   prevFocusedMoment: Moment;
   adjustedFocus: Moment | null;
+  /** Half an hour's height: the minimum, or more so the day fills a taller viewport. */
+  intervalHeight: number;
 }
 
 /** The hour grid behind Week view (7 days) and Day view (1). */
@@ -94,7 +112,7 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
   }
 
   _mounted = false;
-  _pendingInitialCenter = false;
+  _pendingInitialCenter = true;
   _scrollbar = React.createRef<any>();
   _sub: EventRangeSubscription;
   _dayChange?: { dispose(): void };
@@ -108,11 +126,11 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
     const start = alignedStart(dateOf(props.focusedMoment), props.visibleDays);
     this.state = {
       events: [],
-      intervalHeight: MIN_INTERVAL_HEIGHT,
       firstVisible: start,
       scrollTarget: { date: start, animate: false },
       prevFocusedMoment: props.focusedMoment,
       adjustedFocus: null,
+      intervalHeight: MIN_INTERVAL_HEIGHT,
     };
     this._sub = new EventRangeSubscription(props.dataSource, QUERY_MARGIN_DAYS, (events) =>
       this.setState({ events })
@@ -121,11 +139,8 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
 
   componentDidMount() {
     this._mounted = true;
-    // Center after _setIntervalHeight finalizes the grid height (below); centering now
-    // uses a too-short scrollHeight and pushes edge-of-day events off-screen.
-    this._pendingInitialCenter = true;
     this._subscribe();
-    this._setIntervalHeight();
+    this._fitViewport();
     this._publishNavigation();
     // Today's column, the current-time line and its pill are worked out as the view renders.
     this._dayChange = CalendarDateUtils.onDayChange(dateOf(this._now()), () => this.forceUpdate());
@@ -212,6 +227,46 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
     this.props.onChangeFocusedMoment(this._now());
   };
 
+  /** The events on the days shown, for the arrow keys: the all-day row's lanes, then the hours. */
+  dayPlacements(): DayPlacement[] {
+    const { firstVisible } = this.state;
+    const events = withUnsentChange(this.state.events, this.props.unsentChange);
+    const dayStarts = Array.from({ length: this.props.visibleDays }, (_, i) =>
+      CalendarDateUtils.addCalendarDays(firstVisible, i)
+    );
+    const days = dayStarts.map(momentOf);
+    const dayEnds = exclusiveDayEnds(days);
+    const placements: DayPlacement[] = [];
+
+    const { allDayEvents, allDayOverlap } = this._allDay(events, firstVisible);
+    dayStarts.forEach((date, dayIndex) => {
+      for (const occurrence of allDayEvents) {
+        if (eventCoversDate(occurrence, date)) {
+          const top = allDayOverlap[occurrence.id].order - DAY_DUR;
+          placements.push({ occurrence, dayIndex, top, bottom: top, order: 1 });
+        }
+      }
+    });
+
+    const eventsByDay = eventsGroupedByDay(events, days, this._inRow);
+    days.forEach((d, dayIndex) => {
+      const column = { start: d.unix(), end: dayEnds[dayIndex] };
+      const timed = eventsByDay[d.unix()];
+      const overlap = overlapForEvents(timed, column);
+      for (const occurrence of timed) {
+        const { top, bottom } = columnSpan(occurrence, column);
+        placements.push({ occurrence, dayIndex, top, bottom, order: overlap[occurrence.id].order });
+      }
+    });
+    return placements;
+  }
+
+  scrollHours(direction: 1 | -1) {
+    const viewportEl = this._gridScrollRegion.current?.viewportEl;
+    const hour = (3600 / TICK_STEP) * this.state.intervalHeight;
+    if (viewportEl) viewportEl.scrollTop += direction * hour;
+  }
+
   _isToday(day: Moment) {
     return day.isSame(this._now(), 'day');
   }
@@ -220,28 +275,28 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
     centerGridScroll(this._gridScrollRegion.current.viewportEl, this.props.selectedEvents?.[0]);
   }
 
-  _setIntervalHeight = () => {
+  _fitViewport = () => {
     if (!this._mounted) {
       return;
     }
     const viewportHeight = this._gridScrollRegion.current.viewportEl.clientHeight;
     this._legendWrapEl.current.style.height = `${viewportHeight}px`;
+    const intervalHeight = Math.max(MIN_INTERVAL_HEIGHT, viewportHeight / TICKS_PER_DAY);
+    // The whole day shows, so there's nothing to centre.
+    if (viewportHeight >= TICKS_PER_DAY * MIN_INTERVAL_HEIGHT) this._pendingInitialCenter = false;
+    if (intervalHeight !== this.state.intervalHeight) this.setState({ intervalHeight });
+    this._centerOnceSized();
+  };
 
-    this.setState(
-      {
-        intervalHeight: Math.max(
-          viewportHeight / (TICKS_PER_DAY * DAY_PORTION_SHOWN_VERTICALLY),
-          MIN_INTERVAL_HEIGHT
-        ),
-      },
-      () => {
-        // Resize also calls this; only the initial mount should reposition the scroll.
-        if (this._pendingInitialCenter) {
-          this._pendingInitialCenter = false;
-          this._centerScrollRegion();
-        }
-      }
-    );
+  // Once, when there's something to centre: the view mounts behind Mail after a reload, and the
+  // day columns draw after the first render.
+  _centerOnceSized = () => {
+    const viewportEl = this._gridScrollRegion.current?.viewportEl;
+    if (!this._pendingInitialCenter || !viewportEl) return;
+    if (viewportEl.clientHeight > 0 && viewportEl.scrollHeight > viewportEl.clientHeight) {
+      this._pendingInitialCenter = false;
+      this._centerScrollRegion();
+    }
   };
 
   _eventsWithPreviews() {
@@ -254,16 +309,31 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
     );
   }
 
+  /** Whether the all-day row draws it; a new event's draft stays in the grid until it's created. */
+  _inRow = (e: EventOccurrence) => {
+    if (!isTimed(e)) return true;
+    if (!inAllDayRow(e)) return false;
+    const { dragState, heldInGridEventId } = this.props;
+    if (!e.isDragPreview) return !drawnInGrid(e, heldInGridEventId);
+    if (!dragState || e.originalEventId !== dragState.event.id) return false;
+    const { event, containerType } = dragState;
+    return !drawnInGrid(event, heldInGridEventId) || containerType === 'all-day-area';
+  };
+
   /** The all-day lanes for the days drawn around `firstVisible`, which the legend and strip share. */
   _allDay(events: EventOccurrence[], firstVisible: CalendarDate) {
     const drawn = SnapScroller.drawnFrom(firstVisible, this.props.visibleDays, 'day');
     const allDayEvents = events.filter(
-      (e) => !isTimed(e) && e.startDate < drawn.end && e.endDate >= drawn.first
+      (e) => this._inRow(e) && e.startDate < drawn.end && e.endDate >= drawn.first
     );
     const allDayOverlap = overlapForEvents(allDayEvents);
-    // An empty row keeps one lane, so "All Day" sits below the headings.
-    const allDayBarHeight =
-      Math.max(maxConcurrentEvents(allDayOverlap), 1) * MIN_INTERVAL_HEIGHT + 1;
+    // Tall enough for the lanes the days on screen use, not the drawn days either side; an empty
+    // row keeps one lane, so "All Day" sits below the headings.
+    const visibleEnd = CalendarDateUtils.addCalendarDays(firstVisible, this.props.visibleDays);
+    const lanes = allDayEvents
+      .filter((e) => e.startDate < visibleEnd && e.endDate >= firstVisible)
+      .map((e) => allDayOverlap[e.id].order);
+    const allDayBarHeight = Math.max(1, ...lanes) * ALL_DAY_LANE_HEIGHT + EVENT_GAP + 1;
     return { allDayEvents, allDayOverlap, allDayBarHeight };
   }
 
@@ -281,7 +351,7 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
       }
       labels.push(
         <span className="legend-text" key={y} style={{ top }}>
-          {formatShortTime(time.unix())}
+          {withSmallMeridiem(formatShortTime(time.unix()))}
         </span>
       );
     }
@@ -295,11 +365,13 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
   _renderDays = (dayStarts: CalendarDate[], firstVisible: CalendarDate) => {
     const events = this._eventsWithPreviews();
     const days = dayStarts.map(momentOf);
-    const eventsByDay = eventsGroupedByDay(events, days);
+    const eventsByDay = eventsGroupedByDay(events, days, this._inRow);
     const { allDayEvents, allDayOverlap, allDayBarHeight } = this._allDay(events, firstVisible);
     const dayEnds = exclusiveDayEnds(days);
     const todayColumnIdx = days.findIndex((d) => this._isToday(d));
     const firstVisibleIdx = CalendarDateUtils.calendarDaysBetween(dayStarts[0], firstVisible);
+    const isVisible = (dayIdx: number) =>
+      dayIdx >= firstVisibleIdx && dayIdx < firstVisibleIdx + this.props.visibleDays;
     const totalHeight = TICKS_PER_DAY * this.state.intervalHeight;
     const lastDrawn = dayStarts[dayStarts.length - 1];
 
@@ -309,12 +381,14 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
           <div className="date-labels">{days.map(this._renderDateLabel)}</div>
 
           <WeekViewAllDayEvents
-            minorDim={MIN_INTERVAL_HEIGHT}
+            minorDim={ALL_DAY_LANE_HEIGHT}
             height={allDayBarHeight}
             start={CalendarDateUtils.dayStartUnix(dayStarts[0])}
             end={CalendarDateUtils.nextDayStartUnix(lastDrawn) - 1}
             allDayEvents={allDayEvents}
             allDayOverlap={allDayOverlap}
+            firstVisible={firstVisible}
+            visibleEnd={CalendarDateUtils.addCalendarDays(firstVisible, this.props.visibleDays)}
             focusedEvent={this.props.focusedEvent}
             selectedEvents={this.props.selectedEvents}
             onEventClick={this.props.onEventClick}
@@ -332,13 +406,15 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
           ref={this._gridScrollRegion}
           scrollbarRef={this._scrollbar}
           onScroll={(event) => (this._legendWrapEl.current.scrollTop = event.target.scrollTop)}
-          onViewportResize={this._setIntervalHeight}
+          onViewportResize={this._fitViewport}
+          onContentResize={this._centerOnceSized}
         >
           <div className="event-grid" style={{ height: totalHeight }}>
             {days.map((day, dayIdx) => (
               <WeekViewEventColumn
                 day={day}
                 dayEnd={dayEnds[dayIdx]}
+                isTabStop={isVisible(dayIdx)}
                 key={day.valueOf()}
                 events={eventsByDay[day.unix()]}
                 focusedEvent={this.props.focusedEvent}
@@ -354,10 +430,7 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
               />
             ))}
             <CurrentTimeIndicator
-              visible={
-                todayColumnIdx >= firstVisibleIdx &&
-                todayColumnIdx < firstVisibleIdx + this.props.visibleDays
-              }
+              visible={isVisible(todayColumnIdx)}
               gridHeight={totalHeight}
               numColumns={days.length}
               todayColumnIdx={todayColumnIdx}
@@ -383,7 +456,10 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
     const todayOffset = CalendarDateUtils.calendarDaysBetween(firstVisible, dateOf(this._now()));
 
     return (
-      <div className={classnames('calendar-view', 'week-view', { 'day-view': visibleDays === 1 })}>
+      <div
+        className={classnames('calendar-view', 'week-view', { 'day-view': visibleDays === 1 })}
+        tabIndex={-1}
+      >
         <CalendarEventContainer
           onCalendarMouseUp={this.props.onCalendarMouseUp}
           onCalendarMouseDown={this.props.onCalendarMouseDown}
@@ -404,7 +480,7 @@ export class TimeGridView extends React.Component<TimeGridViewProps, TimeGridVie
                 style={{ height: allDayBarHeight + DATE_LABELS_HEIGHT + 1 }}
               >
                 <div className="all-day-legend" style={{ top: DATE_LABELS_HEIGHT }}>
-                  <span className="legend-text">All Day</span>
+                  <span className="legend-text">{localized('All Day')}</span>
                 </div>
               </div>
               <div className="event-grid-legend-wrap" ref={this._legendWrapEl}>

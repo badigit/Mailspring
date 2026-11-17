@@ -1,19 +1,25 @@
 import React, { CSSProperties } from 'react';
 import ReactDOM from 'react-dom';
-import { InjectedComponentSet, SVGIcons } from 'mailspring-component-kit';
-import { CalendarDateUtils, CalendarUtils } from 'mailspring-exports';
+import { InjectedComponentSet, withSmallMeridiem } from 'mailspring-component-kit';
+import { CalendarDateUtils } from 'mailspring-exports';
 import {
   EventOccurrence,
+  isOffCalendar,
   isTimed,
   occurrenceStartUnix,
   occurrenceEndUnix,
 } from './calendar-data-source';
-import { calcEventColors, formatEventTimeRange } from './calendar-helpers';
+import {
+  BarEndTime,
+  BarStartTime,
+  calcEventColors,
+  formatEventTimeRange,
+  formatEventTooltip,
+} from './calendar-helpers';
 import { HitZone, ViewDirection } from './calendar-drag-types';
 import { detectHitZone, canAttemptMove, formatDragPreviewTime } from './calendar-drag-utils';
 import { DAY_DUR, columnSpan } from './week-view-helpers';
-
-const EVENT_GAP = 2;
+import { EVENT_GAP } from './calendar-constants';
 
 interface CalendarEventProps {
   event: EventOccurrence;
@@ -40,6 +46,9 @@ interface CalendarEventProps {
   /** Whether the calendar containing this event is read-only */
   isCalendarReadOnly?: boolean;
 
+  /** False on the days drawn either side of the view, so Tab doesn't select an event off screen. */
+  isTabStop?: boolean;
+
   onClick: (e: React.MouseEvent<any>, event: EventOccurrence) => void;
   onDoubleClick: (event: EventOccurrence) => void;
   onContextMenu?: (event: EventOccurrence) => void;
@@ -64,6 +73,7 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     isDragging: false,
     edgeZoneSize: 12,
     isCalendarReadOnly: false,
+    isTabStop: true,
     onClick: () => {},
     onDoubleClick: () => {},
     onContextMenu: () => {},
@@ -97,7 +107,7 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
   _refocusFrame = 0;
 
   // A moved event is re-drawn under a new id, so the focus its old element had falls to <body>;
-  // taking it back keeps the arrow keys moving it.
+  // taking it back keeps the keys acting on it.
   _takeFocusIfSelected() {
     if (!this.props.selected || document.activeElement !== document.body) {
       return;
@@ -121,14 +131,27 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     onFocused(event);
   }
 
+  // Set by a press until focus leaves. The click after a press selects for itself, and selecting
+  // on its focus too would drop a Cmd-click's other events.
+  _pressing = false;
+
+  _onFocus = () => {
+    if (!this._pressing && !this.props.selected) this.props.onFocused(this.props.event);
+  };
+
+  _onBlur = () => {
+    this._pressing = false;
+  };
+
   _getDimensions() {
     const event = this.props.event;
 
-    // Fractions of the scope: timed events by wall clock down a day column, all-day events by
-    // whole days across the week (remapped in _getStyles).
+    // Fractions of the scope: timed events by wall clock down a day column, the all-day row's
+    // events by whole days across the week (remapped in _getStyles).
     let top: number | string;
     let height: number | string;
-    if (isTimed(event)) {
+    // By where it's drawn: a long timed event sits in the row, or in a column while held there.
+    if (isTimed(event) && this.props.direction === 'vertical') {
       const span = columnSpan(event, { start: this.props.scopeStart, end: this.props.scopeEnd });
       top = span.top / DAY_DUR;
       height = (span.bottom - span.top) / DAY_DUR;
@@ -171,14 +194,18 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     // Gaps between events are cut from the box, not drawn as borders, so the corners stay round.
     if (this.props.direction === 'vertical') {
       const d = this._getDimensions();
-      styles = { ...d, height: `calc(${d.height} - ${EVENT_GAP}px)` };
+      styles = {
+        ...d,
+        width: `calc(${d.width} - ${EVENT_GAP}px)`,
+        height: `calc(${d.height} - ${EVENT_GAP}px)`,
+      };
     } else if (this.props.direction === 'horizontal') {
       const d = this._getDimensions();
       styles = {
         left: `calc(${d.top} + ${EVENT_GAP}px)`,
         width: `calc(${d.height} - ${2 * EVENT_GAP}px)`,
-        height: d.width,
-        top: d.left,
+        height: (d.width as number) - EVENT_GAP,
+        top: (d.left as number) + EVENT_GAP,
       };
     }
     const colors = calcEventColors(this.props.event.calendarId);
@@ -187,17 +214,10 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     styles['--event-text-color'] = colors.text;
     styles['--event-selected-text-color'] = colors.selectedText;
 
-    if (this.props.event.isCancelled) {
-      // Cancelled events get a transparent background with colored border
-      styles.backgroundColor = 'transparent';
-      styles.borderColor = colors.band;
-    } else if (this.props.event.isPending) {
-      // Pending events get a gray background with theme-colored left band
-      styles.backgroundColor = 'rgba(128, 128, 128, 0.15)';
-    } else {
-      // Apple Calendar-style: light pastel background
-      styles.backgroundColor = colors.background;
-    }
+    // Unanswered invitations draw their dashed outline over no fill
+    styles.backgroundColor = this.props.event.isAwaitingMyResponse
+      ? 'transparent'
+      : colors.background;
     return styles;
   }
 
@@ -246,6 +266,7 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
    * Initiate drag on mouse down
    */
   _onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    this._pressing = true;
     if (!this._canDrag() || !this.state.hitZone) {
       return;
     }
@@ -289,56 +310,36 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
       occurrenceEndUnix(event),
       event.isAllDay
     );
-    return <div className="drag-preview-time-tooltip">{timeString}</div>;
+    return <div className="drag-preview-time-tooltip">{withSmallMeridiem(timeString)}</div>;
   }
 
-  /**
-   * Render additional event details for vertical (week view) events:
-   * - Meeting URL domain (e.g., "zoom.us")
-   * - Time range for events >= 1 hour (e.g., "12 – 1PM")
-   */
+  /** The time range under the title of a Day or Week event of 45 minutes or more ("12–1PM"). */
   _renderEventDetails() {
     const { event, direction } = this.props;
-
-    // Only show details for vertical (week view) events
     if (direction !== 'vertical') {
       return null;
     }
-
-    const meetingDomain = CalendarUtils.extractMeetingDomain(event.location, event.description);
     const timeRange = formatEventTimeRange(
       occurrenceStartUnix(event),
       occurrenceEndUnix(event),
       event.isAllDay
     );
-    const hasPhysicalLocation = !meetingDomain && !!event.location;
-
-    if (!meetingDomain && !hasPhysicalLocation && !timeRange) {
+    if (!timeRange) {
       return null;
     }
-
     return (
       <div className="event-details">
-        {meetingDomain && (
-          <span className="event-meeting-link">
-            <SVGIcons.Video className="detail-icon" size={10} strokeWidth={2.6} />
-            {meetingDomain}
-          </span>
-        )}
-        {hasPhysicalLocation && (
-          <span className="event-location">
-            <SVGIcons.Location className="detail-icon" size={10} strokeWidth={2.4} />
-            {event.location}
-          </span>
-        )}
-        {timeRange && (
-          <span className="event-time-range">
-            <SVGIcons.Clock className="detail-icon" size={10} strokeWidth={2.6} />
-            {timeRange}
-          </span>
-        )}
+        <span className="event-time-range">{withSmallMeridiem(timeRange)}</span>
       </div>
     );
+  }
+
+  _spanTime(side: 'start' | 'end') {
+    const { event, direction, scopeStart, scopeEnd } = this.props;
+    if (direction !== 'horizontal' || !isTimed(event)) return null;
+    // Only where it begins and ends, not on a side that runs past the days shown.
+    if (side === 'start') return event.start >= scopeStart ? <BarStartTime event={event} /> : null;
+    return event.end <= scopeEnd ? <BarEndTime event={event} /> : null;
   }
 
   render() {
@@ -349,8 +350,9 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
       'calendar-event',
       direction,
       selected && 'selected',
-      event.isCancelled && 'cancelled',
+      isOffCalendar(event) && 'cancelled',
       event.isPending && 'pending',
+      event.isAwaitingMyResponse && !isOffCalendar(event) && 'awaiting-response',
       isDragging && 'dragging',
       this._canDrag() && 'draggable',
       event.isDragPreview && 'drag-preview',
@@ -378,9 +380,10 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     return (
       <div
         id={event.id}
-        tabIndex={0}
+        tabIndex={this.props.isTabStop ? 0 : -1}
         style={styles}
         className={classNames}
+        title={formatEventTooltip(event)}
         onClick={(e) => {
           e.stopPropagation();
           onClick(e, event);
@@ -397,10 +400,14 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
         onMouseMove={this._onMouseMove}
         onMouseLeave={this._onMouseLeave}
         onMouseDown={this._onMouseDown}
+        onFocus={this._onFocus}
+        onBlur={this._onBlur}
       >
         <span className="default-header" style={{ order: 0 }}>
-          {event.isCancelled ? <s>{event.title}</s> : event.title}
+          {this._spanTime('start')}
+          {isOffCalendar(event) ? <s>{event.title}</s> : event.title}
         </span>
+        {this._spanTime('end')}
         {this._renderEventDetails()}
         <InjectedComponentSet
           className="event-injected-components"

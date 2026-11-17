@@ -1,10 +1,13 @@
+import React from 'react';
 import moment, { Moment } from 'moment';
 import momentTz from 'moment-timezone';
+import { withSmallMeridiem } from 'mailspring-component-kit';
 import {
   CalendarDate,
   Utils,
   AccountStore,
   Calendar,
+  CalendarConflict,
   Actions,
   DateUtils,
   Event,
@@ -21,7 +24,7 @@ import {
   MIN_EVENT_DURATION_SECONDS,
   DEFAULT_TIMED_EVENT_DURATION_SECONDS,
 } from './calendar-constants';
-import { EventOccurrence, coveredDates, isTimed } from './calendar-data-source';
+import { EventOccurrence, TimedOccurrence, coveredDates, isTimed } from './calendar-data-source';
 import { dayFraction } from './week-view-helpers';
 import { canRespondToEvent, isOrganizer } from './calendar-rsvp';
 import type { EventChange } from './recurring-event-actions';
@@ -191,7 +194,7 @@ export function calcColor(calendarId: string) {
 }
 
 /**
- * Get event styling colors for Apple Calendar-style appearance.
+ * An event's colors, from its calendar's.
  * Returns colors for the background (light), left band (solid), and text.
  */
 export function calcEventColors(calendarId: string): {
@@ -360,47 +363,49 @@ export function formatShortTime(unix: number): string {
 }
 
 function shortTimeFormat(time: moment.Moment): string {
-  const lt = DateUtils.localeTimeFormat();
+  const tight = DateUtils.tightTimeFormat();
   // moment's LT uses h for a 12-hour clock and H for a 24-hour one, as in time-picker.tsx
-  if (!/h/.test(lt)) {
-    return lt;
+  if (!/h/.test(tight)) {
+    return tight;
   }
-  const tight = lt.replace(/\s+([aA])$/, '$1');
   return time.minutes() === 0 ? tight.replace(/[:.]mm/, '') : tight;
 }
 
-/**
- * A range in formatShortTime's terms, naming the meridiem once when both ends share it, as Notion
- * Calendar does: "7:30–8:30PM", "11:30AM–12PM".
- */
-export function formatShortTimeRange(startUnix: number, endUnix: number): string {
-  return shortTimeRange(startUnix, endUnix, '–');
-}
+export const BarStartTime = ({ event }: { event: TimedOccurrence }) => (
+  <span className="event-bar-time">{withSmallMeridiem(formatShortTime(event.start))} </span>
+);
 
-function shortTimeRange(startUnix: number, endUnix: number, separator: string): string {
-  const start = moment.unix(startUnix);
-  const end = moment.unix(endUnix);
+export const BarEndTime = ({ event }: { event: TimedOccurrence }) => (
+  <span className="event-bar-end-time">
+    {withSmallMeridiem(localized('ends %@', formatShortTime(event.end)))}
+  </span>
+);
+
+/**
+ * A range in formatShortTime's terms, naming the meridiem once when both ends share it:
+ * "7:30–8:30PM", "11:30AM–12PM". In the machine's zone, or `zone`.
+ */
+export function formatShortTimeRange(startUnix: number, endUnix: number, zone?: string): string {
+  const at = (unix: number) => (zone ? momentTz.tz(unix * 1000, zone) : moment.unix(unix));
+  const start = at(startUnix);
+  const end = at(endUnix);
   let startFormat = shortTimeFormat(start);
   // Only a meridiem standing alone at either end; lb's "[Auer]" literal and ne's "Aको" stay whole.
   const separateMeridiem = /^[aA]\s+|\s*[aA]$/;
   if (/h/.test(startFormat) && start.format('A') === end.format('A')) {
     startFormat = startFormat.replace(separateMeridiem, '');
   }
-  return `${start.format(startFormat)}${separator}${end.format(shortTimeFormat(end))}`;
+  return `${start.format(startFormat)}\u2009–\u2009${end.format(shortTimeFormat(end))}`;
 }
 
-/**
- * The locale's time ("3:15 PM", "15:15"), on a 24-hour clock when the user asked for one. With
- * `dropZeroMinutes` a 12-hour clock shows an hour on the hour as "3 PM"; a 24-hour clock keeps
- * "15:00", where a bare "15" would not read as a time.
- */
-export function formatTime(unix: number, dropZeroMinutes = false): string {
-  const time = moment.unix(unix);
-  const lt = DateUtils.localeTimeFormat();
-  if (dropZeroMinutes && /h/.test(lt) && time.minutes() === 0) {
-    return time.format(lt.replace(/[:.]mm/, ''));
-  }
-  return time.format(lt);
+/** A conflict on one line, "Standup, 9–9:30AM", naming its day when it isn't the day shown. */
+export function formatConflict(conflict: CalendarConflict, shownDayUnix: number): string {
+  const start = moment.unix(conflict.start);
+  const day = start.isSame(moment.unix(shownDayUnix), 'day')
+    ? ''
+    : `${start.format('ddd, MMM D')}, `;
+  const title = conflict.title || localized('(No title)');
+  return `${title}, ${day}${formatShortTimeRange(conflict.start, conflict.end)}`;
 }
 
 /** The line under a search result: the day, or days, and for a timed occurrence its times. */
@@ -416,14 +421,21 @@ export function formatOccurrenceTime(event: EventOccurrence): string {
   const start = moment.unix(event.start);
   const end = moment.unix(event.end);
   if (start.isSame(end, 'day')) {
-    return `${start.format('ddd, MMM D')} \u00B7 ${formatTime(event.start)} - ${formatTime(event.end)}`;
+    return `${start.format('ddd, MMM D')} \u00B7 ${formatShortTimeRange(event.start, event.end)}`;
   }
-  return `${start.format('MMM D')}, ${formatTime(event.start)} - ${end.format('MMM D')}, ${formatTime(event.end)}`;
+  return `${start.format('MMM D')}, ${formatShortTime(event.start)} – ${end.format('MMM D')}, ${formatShortTime(event.end)}`;
+}
+
+/** An event's hover text on the grid: its full title, when it happens, and where. */
+export function formatEventTooltip(event: EventOccurrence): string {
+  return [event.title || localized('(No title)'), formatOccurrenceTime(event), event.location]
+    .filter(Boolean)
+    .join('\n');
 }
 
 /**
- * Format an event's time range for display (e.g., "12 – 1PM").
- * Only returns a string for events that are 1 hour or longer.
+ * Format an event's time range for display (e.g., "12–1PM").
+ * Only for events of 45 minutes or more, whose box has room for a second line.
  * Returns null for shorter events or all-day events.
  */
 export function formatEventTimeRange(
@@ -434,10 +446,10 @@ export function formatEventTimeRange(
   if (isAllDay) {
     return null;
   }
-  if ((endUnix - startUnix) / 60 < 60) {
+  if ((endUnix - startUnix) / 60 < 45) {
     return null;
   }
-  return shortTimeRange(startUnix, endUnix, ' – ');
+  return formatShortTimeRange(startUnix, endUnix);
 }
 
 /**
@@ -496,6 +508,8 @@ export interface CreateCalendarEventOptions {
   isAllDay: boolean;
   calendarId: string;
   accountId: string;
+  /** The zone a timed event's times are written in; the machine's when omitted. */
+  timezone?: string;
   description?: string;
   location?: string;
   attendees?: Array<{ email: string; name?: string }>;
@@ -523,7 +537,7 @@ export function queueNewCalendarEvent(options: CreateCalendarEventOptions): {
     start: options.start,
     end: options.end,
     isAllDay: options.isAllDay,
-    timezone: DateUtils.timeZone,
+    timezone: options.timezone ?? DateUtils.timeZone,
     description: options.description,
     location: options.location,
     organizer: organizerForAccount(options.accountId),
@@ -559,6 +573,89 @@ export function queueNewCalendarEvent(options: CreateCalendarEventOptions): {
 export function centerGridScroll(viewportEl: HTMLElement, selectedEvent?: EventOccurrence): void {
   const fraction = selectedEvent && isTimed(selectedEvent) ? dayFraction(selectedEvent.start) : 0.5;
   viewportEl.scrollTop = viewportEl.scrollHeight * fraction - viewportEl.clientHeight / 2;
+}
+
+export type ArrowDirection = 'up' | 'down' | 'left' | 'right';
+
+/**
+ * One visible day an event is drawn on, counted from the first; the span it covers down that day;
+ * and, among events side by side, its place from the left.
+ */
+export interface DayPlacement {
+  occurrence: EventOccurrence;
+  dayIndex: number;
+  top: number;
+  bottom: number;
+  order: number;
+}
+
+/**
+ * The event an arrow steps to, from the first day `fromId` is drawn on. Left and Right go to the
+ * next event beside this one that overlaps it, then on to the next day with events: there to the
+ * overlapping event on the side they come in from, or failing that the one starting nearest the
+ * same height. They stop at the last day shown.
+ */
+export function eventInDirection(
+  placements: DayPlacement[],
+  fromId: string,
+  direction: ArrowDirection
+): EventOccurrence | null {
+  const from = placements
+    .filter((p) => p.occurrence.id === fromId)
+    .sort((a, b) => a.dayIndex - b.dayIndex)[0];
+  if (!from) return null;
+  const others = (dayIndex: number) =>
+    placements
+      .filter((p) => p.dayIndex === dayIndex && p.occurrence.id !== fromId)
+      .sort((a, b) => a.top - b.top || a.order - b.order);
+
+  if (direction === 'up' || direction === 'down') {
+    const ahead = others(from.dayIndex).filter((p) =>
+      direction === 'down' ? p.top > from.top : p.top < from.top
+    );
+    if (ahead.length === 0) return null;
+    const rowTop = direction === 'down' ? ahead[0].top : ahead[ahead.length - 1].top;
+    const row = ahead.filter((p) => p.top === rowTop);
+    const distance = (p: DayPlacement) => Math.abs(p.order - from.order);
+    return row.reduce((best, p) => (distance(p) < distance(best) ? p : best)).occurrence;
+  }
+
+  const step = direction === 'right' ? 1 : -1;
+  const overlaps = (p: DayPlacement) =>
+    p.top === from.top || (p.top < from.bottom && p.bottom > from.top);
+  // The leftmost of them going right, the rightmost going left; the earliest of a tie.
+  const nearestSide = (candidates: DayPlacement[]) => {
+    const orders = candidates.map((p) => p.order);
+    const edge = step > 0 ? Math.min(...orders) : Math.max(...orders);
+    return candidates.find((p) => p.order === edge).occurrence;
+  };
+
+  const beside = others(from.dayIndex).filter(
+    (p) => overlaps(p) && (p.order - from.order) * step > 0
+  );
+  if (beside.length > 0) return nearestSide(beside);
+
+  const indexes = placements.map((p) => p.dayIndex);
+  const [first, last] = [Math.min(...indexes), Math.max(...indexes)];
+  for (
+    let dayIndex = from.dayIndex + step;
+    dayIndex >= first && dayIndex <= last;
+    dayIndex += step
+  ) {
+    const day = others(dayIndex);
+    if (day.length === 0) continue;
+
+    const overlapping = day.filter(overlaps);
+    if (overlapping.length > 0) return nearestSide(overlapping);
+
+    const distance = (p: DayPlacement) => Math.abs(p.top - from.top);
+    return day.reduce((best, p) => {
+      if (distance(p) !== distance(best)) return distance(p) < distance(best) ? p : best;
+      // Coming in from the right, a row is entered at its right end.
+      return p.top === best.top && step < 0 ? p : best;
+    }).occurrence;
+  }
+  return null;
 }
 
 // A description is markup from whoever sent the invitation. DOMParser's document is inert, so the
@@ -603,6 +700,7 @@ export function hasGuests(event: EventOccurrence): boolean {
 export type PanelField =
   | 'title'
   | 'times'
+  | 'timezone'
   | 'allDay'
   | 'repeat'
   | 'invitees'
@@ -613,6 +711,7 @@ export type PanelField =
 const PANEL_FIELDS: PanelField[] = [
   'title',
   'times',
+  'timezone',
   'allDay',
   'repeat',
   'invitees',
@@ -663,10 +762,14 @@ export function holdsEdits(
   return !isCalendarReadOnly && (hasGuests(event) || asksScope(event) || !!change);
 }
 
-/** The times an event takes when All day is switched: whole days covering it, or 9–10 AM on its first day. */
+/**
+ * The times an event takes when All day is switched: whole days covering it, or 9–10 AM on its
+ * first day, in `zone` when given.
+ */
 export function allDayToggleTimes(
   { startDate, endDate }: Pick<EventOccurrence, 'startDate' | 'endDate'>,
-  allDay: boolean
+  allDay: boolean,
+  zone?: string
 ) {
   if (allDay) {
     return {
@@ -674,6 +777,8 @@ export function allDayToggleTimes(
       end: CalendarDateUtils.nextDayStartUnix(endDate),
     };
   }
-  const start = CalendarDateUtils.secondsIntoDayUnix(startDate, 9 * 3600);
+  const start = zone
+    ? momentTz.tz(`${CalendarDateUtils.formatCalendarDate(startDate)}T09:00`, zone).unix()
+    : CalendarDateUtils.secondsIntoDayUnix(startDate, 9 * 3600);
   return { start, end: start + DEFAULT_TIMED_EVENT_DURATION_SECONDS };
 }

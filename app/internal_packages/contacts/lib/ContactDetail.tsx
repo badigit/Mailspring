@@ -4,16 +4,24 @@ import {
   localized,
   Actions,
   SyncbackContactTask,
-  AccountStore,
   ContactGroup,
   DatabaseStore,
   TaskQueue,
+  WorkspaceStore,
 } from 'mailspring-exports';
 import { isEqual } from 'underscore';
 import { FocusContainer, ListensToFluxStore, ScrollRegion } from 'mailspring-component-kit';
-import { parse, ContactBase, ContactInteractorMetadata, apply } from './ContactInfoMapping';
+import {
+  parse,
+  ContactBase,
+  ContactInteractorMetadata,
+  apply,
+  contactSourceForAccount,
+  emptyContactForAccount,
+} from './ContactInfoMapping';
 import { ContactDetailRead } from './ContactDetailRead';
 import { ContactDetailEdit } from './ContactDetailEdit';
+import { displayNameForContact } from './ContactDisplayName';
 import { Store, ContactsPerspective } from './Store';
 
 interface ContactDetailProps {
@@ -30,36 +38,44 @@ interface ContactDetailState {
   metadata: ContactInteractorMetadata | null;
 }
 
-function emptyContactForAccountId(accountId: string) {
-  const account = AccountStore.accountForId(accountId);
-  const source = account.provider === 'gmail' ? 'gpeople' : 'carddav';
-  const info: Contact['info'] =
-    source === 'gpeople'
-      ? {
-          names: [],
-          resourceName: '',
-          etag: '',
-          addresses: [],
-        }
-      : {
-          vcf: `BEGIN:VCARD\r\nVERSION:3.0\r\nUID:${crypto.randomUUID()}\r\nEND:VCARD\r\n`,
-          href: '',
-        };
+export class ContactDetailWithFocus extends React.Component<
+  ContactDetailProps,
+  ContactDetailState
+> {
+  _removeLeaveGuard: () => void;
 
-  return new Contact({
-    source,
-    name: '',
-    email: '',
-    accountId: account.id,
-    info,
-  });
-}
-
-class ContactDetailWithFocus extends React.Component<ContactDetailProps, ContactDetailState> {
   constructor(props: ContactDetailProps) {
     super(props);
     this.state = this.getStateForProps();
   }
+
+  componentDidMount() {
+    this._removeLeaveGuard = WorkspaceStore.setSectionLeaveGuard(this._mayLeaveSection);
+  }
+
+  componentWillUnmount() {
+    this._removeLeaveGuard();
+  }
+
+  // Switching sections unmounts the editor, and the typed changes live only in its state.
+  _mayLeaveSection = () => {
+    const { editing } = this.props;
+    const { contact, data } = this.state;
+    if (!editing || !contact || isEqual(data, parse(contact).data)) return true;
+
+    const name = editing === 'new' ? localized('New Contact') : displayNameForContact(contact);
+    const response = require('@electron/remote').dialog.showMessageBoxSync({
+      type: 'question',
+      buttons: [localized('Save Changes'), localized('Discard'), localized('Keep editing')],
+      defaultId: 0,
+      cancelId: 2,
+      message: localized('"%@" has unsaved changes.', name),
+    });
+    if (response === 2) return false;
+    if (response === 0) this.onSaveChanges();
+    else this.onCancel();
+    return true;
+  };
 
   componentDidUpdate(prevProps: ContactDetailProps) {
     const prevContact = prevProps.contacts?.find((c) => c.id === prevProps.focusedId);
@@ -75,7 +91,10 @@ class ContactDetailWithFocus extends React.Component<ContactDetailProps, Contact
 
     const contact =
       editing === 'new' && 'accountId' in perspective
-        ? emptyContactForAccountId(perspective.accountId)
+        ? emptyContactForAccount(
+            perspective.accountId,
+            contactSourceForAccount(perspective.accountId, Store.books())
+          )
         : contacts?.find((c) => c.id === focusedId);
 
     if (!contact) {
@@ -96,14 +115,10 @@ class ContactDetailWithFocus extends React.Component<ContactDetailProps, Contact
   };
 
   onSaveChanges = () => {
-    const { perspective } = this.props;
     const contact = apply(this.state.contact, this.state.data);
-
-    if (!('accountId' in perspective)) return;
-
     const task = contact.id
       ? SyncbackContactTask.forUpdating({ contact })
-      : SyncbackContactTask.forCreating({ contact, accountId: perspective.accountId });
+      : SyncbackContactTask.forCreating({ contact, accountId: contact.accountId });
     Actions.queueTask(task);
     Store.setEditing(false);
 
@@ -123,7 +138,7 @@ class ContactDetailWithFocus extends React.Component<ContactDetailProps, Contact
       return (
         <div className="contact-detail-column">
           <div className="contacts-empty-state">
-            <div className="message">No contact selected.</div>
+            <div className="message">{localized('No contact selected.')}</div>
           </div>
         </div>
       );
@@ -136,6 +151,7 @@ class ContactDetailWithFocus extends React.Component<ContactDetailProps, Contact
             <ContactDetailEdit
               data={data}
               contact={contact}
+              metadata={metadata}
               onChange={(changes) => this.setState({ data: { ...data, ...changes } })}
             />
           ) : (

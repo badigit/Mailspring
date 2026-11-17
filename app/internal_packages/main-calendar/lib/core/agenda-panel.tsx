@@ -1,6 +1,6 @@
 import React from 'react';
 import moment from 'moment-timezone';
-import { ScrollRegion, SVGIcons } from 'mailspring-component-kit';
+import { RetinaImg, ScrollRegion, withSmallMeridiem } from 'mailspring-component-kit';
 import { localized, Actions, CalendarDate, CalendarDateUtils, DateUtils } from 'mailspring-exports';
 import { MailspringCalendarViewProps } from './mailspring-calendar';
 import { CalendarEventPopover } from './calendar-event-popover';
@@ -11,8 +11,15 @@ import {
   isTimed,
   occurrenceStartUnix,
   isEventSelected,
+  isOffCalendar,
 } from './calendar-data-source';
-import { calcEventColors, dateOf, formatShortTimeRange, momentOf } from './calendar-helpers';
+import {
+  calcEventColors,
+  dateOf,
+  formatOccurrenceTime,
+  formatShortTimeRange,
+  momentOf,
+} from './calendar-helpers';
 
 const DAYS_IN_PANEL = 14;
 
@@ -22,6 +29,8 @@ export type AgendaPanelProps = Pick<
 > & {
   onEventDoubleClick?: (event: EventOccurrence) => void;
   onNewEvent?: (button: HTMLElement) => void;
+  /** Pinned above the days, in the mail sidebar, for the event of the email being read. */
+  inThisEmail?: EventOccurrence | null;
 };
 
 interface DayEvents {
@@ -77,7 +86,6 @@ export class AgendaPanel extends React.Component<AgendaPanelProps, AgendaPanelSt
     return { first, end: CalendarDateUtils.addCalendarDays(first, DAYS_IN_PANEL) };
   }
 
-  /** Only the days with something on, as Notion Calendar lists them. */
   _getEventsByDay(): DayEvents[] {
     const { first } = this._calculateRange();
     const days: DayEvents[] = [];
@@ -86,7 +94,7 @@ export class AgendaPanel extends React.Component<AgendaPanelProps, AgendaPanelSt
       const date = CalendarDateUtils.addCalendarDays(first, i);
 
       const events = this.state.events
-        .filter((event) => eventCoversDate(event, date))
+        .filter((event) => !isOffCalendar(event) && eventCoversDate(event, date))
         .sort((a, b) => {
           // All-day events first, then sort by start time
           if (a.isAllDay && !b.isAllDay) return -1;
@@ -106,7 +114,7 @@ export class AgendaPanel extends React.Component<AgendaPanelProps, AgendaPanelSt
     }
     return (
       <div className="agenda-event-time">
-        {formatShortTimeRange(event.start, event.end)}{' '}
+        {withSmallMeridiem(formatShortTimeRange(event.start, event.end))}{' '}
         <span className="agenda-event-duration">
           {DateUtils.formatDuration(event.end - event.start)}
         </span>
@@ -147,18 +155,20 @@ export class AgendaPanel extends React.Component<AgendaPanelProps, AgendaPanelSt
     );
   };
 
-  _renderEvent(event: EventOccurrence, dayKey: string) {
+  _renderEvent(event: EventOccurrence, dayKey: string, time = this._renderEventTime(event)) {
     const colors = calcEventColors(event.calendarId);
     const isSelected = isEventSelected(this.props.selectedEvents, event);
 
     // Use a day-unique id/key so multi-day events don't produce duplicate DOM ids
     const uniqueId = `${event.id}-${dayKey}`;
+    const isStruck = isOffCalendar(event);
 
     const className = [
       'agenda-event',
       isSelected && 'selected',
-      event.isCancelled && 'cancelled',
-      event.isPending && 'pending',
+      isStruck && 'cancelled',
+      !isStruck && event.isPending && 'pending',
+      !isStruck && event.isAwaitingMyResponse && 'awaiting-response',
     ]
       .filter(Boolean)
       .join(' ');
@@ -168,21 +178,35 @@ export class AgendaPanel extends React.Component<AgendaPanelProps, AgendaPanelSt
         id={uniqueId}
         key={uniqueId}
         className={className}
+        style={{ '--event-band-color': colors.band } as React.CSSProperties}
         onClick={(e) => this.props.onEventClick(e, event)}
         onDoubleClick={(e) => this._onAgendaEventDoubleClick(e, event)}
         tabIndex={0}
       >
-        <div className="agenda-event-color-bar" style={{ backgroundColor: colors.band }} />
+        <div className="agenda-event-color-bar" />
         <div className="agenda-event-details">
           <div className="agenda-event-title">
-            {event.isCancelled ? (
+            {isStruck ? (
               <s>{event.title || localized('(No title)')}</s>
             ) : (
               event.title || localized('(No title)')
             )}
           </div>
-          {this._renderEventTime(event)}
+          {time}
         </div>
+      </div>
+    );
+  }
+
+  _renderInThisEmail(event: EventOccurrence) {
+    return (
+      <div className="agenda-in-this-email">
+        <div className="agenda-in-this-email-label">{localized('In this email')}</div>
+        {this._renderEvent(
+          event,
+          'in-this-email',
+          <div className="agenda-event-time">{formatOccurrenceTime(event)}</div>
+        )}
       </div>
     );
   }
@@ -213,10 +237,11 @@ export class AgendaPanel extends React.Component<AgendaPanelProps, AgendaPanelSt
                 this.props.onNewEvent(e.currentTarget);
               }}
             >
-              <SVGIcons.Plus size={16} />
+              <RetinaImg name="toolbar-compose.png" mode={RetinaImg.Mode.ContentIsMask} />
             </button>
           </div>
         )}
+        {this.props.inThisEmail && this._renderInThisEmail(this.props.inThisEmail)}
         <ScrollRegion className="agenda-scroll-region">
           <div className="agenda-event-list">
             {days.length > 0 ? (

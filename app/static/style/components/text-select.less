@@ -1,0 +1,39 @@
+@import 'ui-variables';
+
+.text-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  // A long choice ends in "…" inside its row, so the caret stays in view.
+  min-width: 0;
+  max-width: 100%;
+
+  select {
+    appearance: none;
+    field-sizing: content;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 14px 0 0;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    color: inherit;
+    font: inherit;
+    outline: none;
+  }
+
+  img.content-mask {
+    position: absolute;
+    right: 0;
+    pointer-events: none;
+    visibility: hidden;
+    background-color: @text-color-very-subtle;
+  }
+
+  &:hover img.content-mask {
+    visibility: visible;
+  }
+}

@@ -218,9 +218,9 @@ describe('moving an event with guests', function () {
   it('holds arrow-key moves, each starting from the held time', async function () {
     const calendar = calendarWith([withGuests]);
 
-    calendar._onMoveSelectedEvent('down', false);
+    calendar._onMoveSelectedEvent('down');
     await settle();
-    calendar._onMoveSelectedEvent('down', false);
+    calendar._onMoveSelectedEvent('down');
     await settle();
 
     expect(queueTask).not.toHaveBeenCalled();
@@ -334,6 +334,26 @@ describe('leaving an event with a held change', function () {
     spyOn(WorkspaceStore, 'trigger');
     WorkspaceStore._onSelectRootSheet(calendarSection);
     mount(calendar);
+    dialog.andReturn('keep-editing');
+    try {
+      WorkspaceStore._onSelectRootSheet(mailSection);
+      expect(dialog).toHaveBeenCalled();
+      expect(WorkspaceStore.rootSheet()).toBe(calendarSection);
+    } finally {
+      calendar.componentWillUnmount();
+      (WorkspaceStore as any)._sheetStack = saved;
+    }
+  });
+
+  it("still asks after the mail sidebar's panel, mounted before it, unmounts", function () {
+    const calendarSection = { id: 'SpecCalendar', root: true, supportedModes: ['list'] } as any;
+    const mailSection = { id: 'SpecMail', root: true, supportedModes: ['list'] } as any;
+    const saved = WorkspaceStore.sheetStack().slice();
+    spyOn(WorkspaceStore, 'trigger');
+    const removeSidebarGuard = WorkspaceStore.setSectionLeaveGuard(() => true);
+    WorkspaceStore._onSelectRootSheet(calendarSection);
+    mount(calendar);
+    removeSidebarGuard();
     dialog.andReturn('keep-editing');
     try {
       WorkspaceStore._onSelectRootSheet(mailSection);
@@ -524,7 +544,7 @@ describe('editing in the panel', function () {
     });
 
     it('saves a title still being typed, as leaving the field would', function () {
-      const title = host.querySelector('input.event-panel-title') as HTMLInputElement;
+      const title = host.querySelector('.event-panel-title input') as HTMLInputElement;
       title.focus();
       panel._title.current.setState({ draft: 'Interview with Alex' });
       panel.commitEdits();
@@ -561,7 +581,7 @@ describe('editing in the panel', function () {
     });
 
     it('returns to the field last edited once a click has moved focus away', function () {
-      const title = host.querySelector('input.event-panel-title') as HTMLInputElement;
+      const title = host.querySelector('.event-panel-title input') as HTMLInputElement;
       title.focus();
       const clicked = document.createElement('div');
       clicked.tabIndex = -1;
@@ -786,7 +806,7 @@ describe('a repeating event', function () {
     );
     const calendar = calendarWith([]);
     await calendar._persistDragChange(droppedAt(first, START + HOUR));
-    calendar._onMoveSelectedEvent('down', false);
+    calendar._onMoveSelectedEvent('down');
     await settle();
 
     expect(recurringDialog).not.toHaveBeenCalled();

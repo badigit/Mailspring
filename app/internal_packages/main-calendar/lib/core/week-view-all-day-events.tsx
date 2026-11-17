@@ -1,5 +1,5 @@
 import React from 'react';
-import { Utils } from 'mailspring-exports';
+import { CalendarDate, Utils } from 'mailspring-exports';
 import { CalendarEvent } from './calendar-event';
 import { EventOccurrence, isEventSelected } from './calendar-data-source';
 import { OverlapByEventId } from './week-view-helpers';
@@ -20,6 +20,9 @@ interface WeekViewAllDayEventsProps extends EventRendererProps {
   minorDim: number;
   allDayEvents: EventOccurrence[];
   allDayOverlap: OverlapByEventId;
+  /** The days on screen, first and exclusive end; only their events are Tab stops. */
+  firstVisible: CalendarDate;
+  visibleEnd: CalendarDate;
   dragState: DragState | null;
   onEventDragStart: (
     event: EventOccurrence,
@@ -73,10 +76,12 @@ export class WeekViewAllDayEvents extends React.Component<WeekViewAllDayEventsPr
             concurrentEvents={allDayOverlap[e.id]?.concurrentEvents || 1}
             onClick={this.props.onEventClick}
             onDoubleClick={this.props.onEventDoubleClick}
+            onContextMenu={this.props.onEventContextMenu}
             onFocused={this.props.onEventFocused}
             isDragging={dragState?.event.id === e.id}
             onDragStart={onEventDragStart}
             isCalendarReadOnly={readOnlyCalendarIds.has(e.calendarId)}
+            isTabStop={e.startDate < this.props.visibleEnd && e.endDate >= this.props.firstVisible}
           />
         ))}
       </div>

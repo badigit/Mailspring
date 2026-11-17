@@ -1,3 +1,4 @@
+import moment from 'moment';
 import Rx from 'rx-lite';
 import {
   Event,
@@ -30,6 +31,7 @@ export interface EventAttendee {
 type ICAL = typeof import('ical.js').default;
 type ICALEvent = InstanceType<ICAL['Event']>;
 type ICALTime = InstanceType<ICAL['Time']>;
+type ICALComponent = InstanceType<ICAL['Component']>;
 
 /** An ICAL.Time's date, taken from its parts so no timezone is applied on the way. */
 function dateFromICALTime(time: ICALTime): CalendarDate {
@@ -60,6 +62,14 @@ export function isEventSelected(
  */
 export function isTimed(e: EventOccurrence): e is TimedOccurrence {
   return e.isAllDay === false;
+}
+
+/**
+ * Whether the week and day views draw it in the all-day row: an all-day event, or a timed one of
+ * a day or more, counted to the same clock time a day later so a DST change doesn't tip it.
+ */
+export function inAllDayRow(e: EventOccurrence): boolean {
+  return !isTimed(e) || e.end >= moment.unix(e.start).add(1, 'day').unix();
 }
 
 /**
@@ -147,13 +157,12 @@ interface OccurrenceBase {
   location: string;
   description: string;
   isCancelled: boolean;
-  /**
-   * True if this event should display with "pending" styling (hatched pattern).
-   * This includes:
-   * - Events with STATUS=TENTATIVE
-   * - Events where the current user is an attendee but hasn't accepted (NEEDS-ACTION or TENTATIVE)
-   */
+  /** Tentative, drawn striped: STATUS=TENTATIVE, or our own answer is Maybe. */
   isPending: boolean;
+  /** An invitation we haven't answered, drawn with a dashed outline. */
+  isAwaitingMyResponse?: boolean;
+  /** An invitation we declined, drawn like a cancelled event. Exchange removes these itself. */
+  isDeclined?: boolean;
   /**
    * True when this account organizes the event, or nobody does, or its ORGANIZER is the address
    * of the calendar it sits on and the server says that calendar is ours (Google writes a
@@ -172,7 +181,7 @@ interface OccurrenceBase {
   recurrenceIdStart?: number;
   /** True if this event is part of a recurring series (has RRULE/RDATE) */
   isRecurring: boolean;
-  organizer: { email: string } | null;
+  organizer: { email: string; name?: string } | null;
   attendees: EventAttendee[];
 
   /** True if this is a synthetic drag preview event (not a real event) */
@@ -194,6 +203,11 @@ export interface TimedOccurrence extends OccurrenceBase {
 }
 
 export type EventOccurrence = AllDayOccurrence | TimedOccurrence;
+
+/** Cancelled, or declined by us: either way it's off our calendar, so both draw alike. */
+export function isOffCalendar(e: EventOccurrence): boolean {
+  return e.isCancelled || !!e.isDeclined;
+}
 
 // Minimal type for focusing/highlighting an event on the calendar
 /**
@@ -232,6 +246,33 @@ export function readOnlyCalendarIds(calendars: Calendar[]): Set<string> {
   return new Set(calendars.filter((c) => c.readOnly).map((c) => c.id));
 }
 
+type CalendarExpansionInputs = Pick<
+  Parameters<typeof occurrencesForEvents>[1],
+  'ownCalendarAddresses' | 'readOnlyCalendarIds'
+>;
+
+/**
+ * What expansion reads from the Calendar rows, emitted only when it changes. A calendar sync
+ * re-persists every row to record its sync state, and re-expanding every series for each of those
+ * deltas stalls the window for a quarter second apiece just after the calendar opens.
+ *
+ * Google rewrites ORGANIZER on a secondary calendar to the calendar's own id, so a meeting
+ * organized by the calendar it sits on is ours when the calendar is.
+ */
+function calendarExpansionInputs(): Rx.Observable<CalendarExpansionInputs> {
+  return Rx.Observable.fromQuery(DatabaseStore.findAll<Calendar>(Calendar))
+    .map((cals: Calendar[]) => ({
+      ownCalendarAddresses: ownCalendarAddresses(cals),
+      readOnlyCalendarIds: readOnlyCalendarIds(cals),
+    }))
+    .distinctUntilChanged((inputs) =>
+      JSON.stringify([
+        [...inputs.ownCalendarAddresses].sort(),
+        [...inputs.readOnlyCalendarIds].sort(),
+      ])
+    );
+}
+
 /** Strip mailto: prefix from email addresses (common in iCalendar data) */
 function normalizeEmail(email: string): string {
   return email.replace(/^mailto:/i, '');
@@ -251,19 +292,11 @@ export class CalendarDataSource {
     }
 
     const query = DatabaseStore.findAll<Event>(Event).where(matcher);
-    // Google rewrites ORGANIZER on a secondary calendar to the calendar's own id, so a meeting
-    // organized by the calendar it sits on is ours when the calendar is.
-    const calendars = Rx.Observable.fromQuery(DatabaseStore.findAll<Calendar>(Calendar));
     this.observable = Rx.Observable.combineLatest(
       Rx.Observable.fromQuery(query),
-      calendars,
-      (results: Event[], cals: Calendar[]) => ({
-        events: occurrencesForEvents(results, {
-          startUnix,
-          endUnix,
-          ownCalendarAddresses: ownCalendarAddresses(cals),
-          readOnlyCalendarIds: readOnlyCalendarIds(cals),
-        }),
+      calendarExpansionInputs(),
+      (results: Event[], inputs: CalendarExpansionInputs) => ({
+        events: occurrencesForEvents(results, { startUnix, endUnix, ...inputs }),
       })
     );
     return this.observable;
@@ -352,10 +385,10 @@ function occurrenceFromICS(args: {
     return !!account && account.id === event.accountId;
   };
 
-  // Pending styling also covers an event I'm invited to but haven't answered
   const myAttendee = attendees.find((a) => a.email && isThisAccount(a.email));
   const myPartstat = myAttendee?.partstat?.toUpperCase();
-  const isAwaitingMyResponse = myAttendee && myPartstat !== 'ACCEPTED' && myPartstat !== 'DECLINED';
+  const isAwaitingMyResponse =
+    !!myAttendee && !['ACCEPTED', 'DECLINED', 'TENTATIVE'].includes(myPartstat);
 
   const organizerEmail = item.organizer
     ? normalizeEmail(CalendarUtils.emailFromParticipantURI(String(item.organizer)) || '')
@@ -387,13 +420,20 @@ function occurrenceFromICS(args: {
     startDate,
     endDate,
     isCancelled: status === 'CANCELLED',
-    isPending: status === 'TENTATIVE' || !!isAwaitingMyResponse,
+    isPending: status === 'TENTATIVE' || myPartstat === 'TENTATIVE',
+    isAwaitingMyResponse,
+    isDeclined: myPartstat === 'DECLINED',
     isMine: !organizerEmail || iAmOrganizer,
     isFree: item.component?.getFirstPropertyValue('transp') === 'TRANSPARENT',
     isException: args.isException ?? !!rid,
     recurrenceIdStart: rid ? (rid as any).toJSDate().getTime() / 1000 : undefined,
     isRecurring: args.isRecurring,
-    organizer: organizerEmail ? { email: organizerEmail } : null,
+    organizer: organizerEmail
+      ? {
+          email: organizerEmail,
+          name: item.component?.getFirstProperty('organizer')?.getFirstParameter('cn') || '',
+        }
+      : null,
     attendees,
   };
 
@@ -402,20 +442,73 @@ function occurrenceFromICS(args: {
     : { ...base, isAllDay: false, start: startUnix, end: endUnix };
 }
 
+interface ExceptionSource {
+  exception: Event;
+  /** Null when a later master copy no longer holds the occurrence. */
+  event: ICALEvent | null;
+  /** The row's copy is later than its master's, so it redraws the master's version of the slot. */
+  replacesMasters: boolean;
+}
+
 /**
- * The VEVENT an exception row stands for. The engine stores the whole calendar resource on every
- * row it holds, master included, so it is the one whose RECURRENCE-ID the row names; a resource
- * holding the exception alone has only that one.
+ * The VEVENT an exception row is drawn from, out of the later of its own copy and its series'
+ * master row's copy. A sync gives every row of a UID the whole resource (Mailspring-Sync
+ * DAVWorker.cpp storeResource, MicrosoftCalendarWorker.cpp ingestEvent), but a task's local phase
+ * writes only its own row (TaskProcessor::performLocalSyncbackEvent), so rows disagree until a sync
+ * stores the server's copy again, and an engine before Mailspring-Sync#187 left older rows behind.
+ * A later master copy without the row's RECURRENCE-ID cancelled that occurrence or split it into a
+ * new series.
  */
-function exceptionICSEvent(exception: Event): ICALEvent {
-  const { root, event } = CalendarUtils.parseICSString(exception.ics);
-  const own = root.getAllSubcomponents('vevent').find((vevent) => {
-    const rid = vevent.getFirstPropertyValue('recurrence-id') as ICALTime | null;
-    return rid && rid.toICALString() === exception.recurrenceId;
-  });
-  if (!own) return event;
+function exceptionSource(exception: Event, mastersCopy: ICALComponent | null): ExceptionSource {
   const ICAL: ICAL = require('ical.js');
-  return new ICAL.Event(own);
+  const named = (root: ICALComponent) =>
+    root.getAllSubcomponents('vevent').find((vevent) => {
+      const rid = vevent.getFirstPropertyValue('recurrence-id') as ICALTime | null;
+      return rid && rid.toICALString() === exception.recurrenceId;
+    });
+  const own = CalendarUtils.parseICSString(exception.ics);
+  if (mastersCopy && isLaterCopy(mastersCopy, own.root)) {
+    const vevent = named(mastersCopy);
+    return { exception, event: vevent ? new ICAL.Event(vevent) : null, replacesMasters: false };
+  }
+  const vevent = named(own.root);
+  if (!vevent) {
+    return { exception, event: own.event, replacesMasters: false };
+  }
+  return {
+    exception,
+    event: new ICAL.Event(vevent),
+    replacesMasters: !!mastersCopy && isLaterCopy(own.root, mastersCopy),
+  };
+}
+
+/**
+ * Whether copy `a` of a resource changed after copy `b`, by the newest DTSTAMP on their VEVENTs.
+ * Without a METHOD, DTSTAMP is when the store last revised the component (RFC 5545 3.8.7.2).
+ * Google sets it to LAST-MODIFIED; Graph's copies carry it alone (GraphICS.cpp). A copy with a
+ * VEVENT lacking one can't be judged, so neither copy is later.
+ */
+function isLaterCopy(a: ICALComponent, b: ICALComponent): boolean {
+  return lastStamped(a) > lastStamped(b);
+}
+
+function lastStamped(root: ICALComponent): number {
+  return Math.max(
+    ...root
+      .getAllSubcomponents('vevent')
+      .map(
+        (vevent) =>
+          (vevent.getFirstPropertyValue('dtstamp') as ICALTime | null)?.toUnixTime() ?? NaN
+      )
+  );
+}
+
+function readableRoot(ics: string): ICALComponent | null {
+  try {
+    return CalendarUtils.parseICSString(ics).root;
+  } catch (err) {
+    return null;
+  }
 }
 
 export function occurrencesForEvents(
@@ -489,6 +582,21 @@ function seriesOccurrences(
   // Separate master from exceptions
   const master = events.find((e) => !e.recurrenceId);
   const exceptions = events.filter((e) => e.recurrenceId);
+  const mastersCopy = master && exceptions.length > 0 ? readableRoot(master.ics) : null;
+  const sources: ExceptionSource[] = [];
+  for (const exception of exceptions) {
+    try {
+      sources.push(exceptionSource(exception, mastersCopy));
+    } catch (err) {
+      console.error(`Failed to parse ICS for exception ${exception.id}:`, err);
+    }
+  }
+  // Slots a later exception row draws, so the master's older copy doesn't draw them too.
+  const replacedSlots = new Set(
+    sources
+      .filter((source) => source.replacesMasters)
+      .map((source) => source.event.recurrenceId.toUnixTime())
+  );
 
   // Track occurrence start times generated from master expansion
   // to avoid duplicates when exceptions are in the same ICS file
@@ -511,6 +619,9 @@ function seriesOccurrences(
       const masterIsRecurring = ICSEventHelpers.isRecurringEvent(master.ics);
 
       expanded.forEach((e) => {
+        if (e.recurrenceId && replacedSlots.has(e.recurrenceId.toUnixTime())) {
+          return;
+        }
         const start = e.startDate.toJSDate().getTime() / 1000;
         const item = ICSEventHelpers.expandedEvent(e);
         expandedStartTimes.add(start);
@@ -579,11 +690,13 @@ function seriesOccurrences(
   }
 
   // Standalone exception rows, unless the master's expansion already drew them. The start
-  // compared is the row's own VEVENT read here, not its recurrenceStart column: the sync engine
+  // compared is the row's VEVENT read above, not its recurrenceStart column: the sync engine
   // computes that column, and it need not read a zoned time to the same second.
-  for (const exception of exceptions) {
+  for (const { exception, event: icsEvent } of sources) {
+    if (!icsEvent) {
+      continue;
+    }
     try {
-      const icsEvent = exceptionICSEvent(exception);
       const occStart = icsEvent.startDate.toJSDate().getTime() / 1000;
       const occEnd = icsEvent.endDate.toJSDate().getTime() / 1000;
       if (expandedStartTimes.has(occStart)) {
@@ -680,6 +793,53 @@ export function focusedEventInfoForEvents(
   }
 
   return occurrence ? { id: occurrence.id, start: occurrenceStartUnix(occurrence) } : null;
+}
+
+/** An event named by UID, as an invitation's View in Calendar link names it. */
+export interface EventRef {
+  icsuid: string;
+  accountId: string;
+  /** Picks one copy when the account holds the event on several calendars. */
+  calendarId?: string;
+  recurrenceIdStart?: number;
+}
+
+/** The occurrence `focusedEventInfoForEvents` picks for an event named by UID. */
+export async function focusedOccurrenceForIcsuid(
+  { icsuid, accountId, calendarId, recurrenceIdStart }: EventRef,
+  calendars: Calendar[],
+  nowUnix = Date.now() / 1000
+): Promise<EventOccurrence | null> {
+  const events = await DatabaseStore.findAll<Event>(Event).where(
+    calendarId ? { icsuid, accountId, calendarId } : { icsuid, accountId }
+  );
+  const info = focusedEventInfoForEvents(events, nowUnix, recurrenceIdStart);
+  if (!info) return null;
+  // Expanded again with our calendars, so a meeting a secondary calendar of ours organizes is ours.
+  const occurrences = occurrencesForEvents(events, {
+    startUnix: info.start - 1,
+    endUnix: info.start + 1,
+    ownCalendarAddresses: ownCalendarAddresses(calendars),
+  });
+  return occurrences.find((o) => o.id === info.id) ?? null;
+}
+
+/**
+ * Which panel a selection shows, null for none. A series' occurrences share an event id, but not
+ * a field's just-saved text. The slot survives a move, so moving an occurrence keeps its panel.
+ */
+export function panelKey(selected: EventOccurrence[]) {
+  if (selected.length !== 1) return null;
+  const [event] = selected;
+  const eventId = CalendarUtils.parseOccurrenceId(event.id).eventId;
+  return event.isRecurring ? `${eventId}@${occurrenceSlot(event)}` : eventId;
+}
+
+/** An occurrence's id embeds its start; a series exception stored as its own row keeps its id. */
+export function movedOccurrenceId(occurrence: EventOccurrence, event: Event, newStart: number) {
+  return event.isRecurrenceException()
+    ? occurrence.id
+    : CalendarUtils.occurrenceId(event.id, newStart);
 }
 
 /** The occurrence as its row draws it now; null once it's gone or a move landed unpredicted. */

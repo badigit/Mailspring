@@ -4,7 +4,7 @@ import { openManageCredentials } from '../credentials/credential-sheet';
 import React from 'react';
 import classnames from 'classnames';
 import { localized } from 'mailspring-exports';
-import { RetinaImg } from 'mailspring-component-kit';
+import { RetinaImg, ScrollRegion } from 'mailspring-component-kit';
 import { ViewManifest, ViewRegistryEvents, allViews } from '../view-registry';
 import { isPinned, onPinsChanged, setPinned } from '../nav/pins';
 import { ViewBadgeEvents, badgeFor } from '../nav/badges';
@@ -27,7 +27,7 @@ const BACKDROP_VARIANT = 'grid-fine';
 // Building happens remotely; running happens here. Said wherever a View gets created.
 const CLOUD_NOTE = () =>
   localized(
-    "When you build a view, example emails and screenshots you explicitly share are sent to Mailspring's servers. Once built, views are entirely private and use Apple Intelligence or open models to extract data and summarize mail locally on your computer."
+    "When you build a View, example emails and screenshots you explicitly share are sent to Mailspring's servers. Once built, Views are entirely private and use Apple Intelligence or open models to extract data and summarize mail locally on your computer."
   );
 
 interface ViewsHomeState {
@@ -171,7 +171,7 @@ export class ViewsHome extends React.Component<Record<string, never>, ViewsHomeS
             <div className="views-home-create-title">{localized('Create a View')}</div>
             <div className="views-home-create-subtitle">
               {localized(
-                "Describe your view, share example emails, and Mailspring's AI builds it with you."
+                "Describe your View, share example emails, and Mailspring's AI builds it with you."
               )}
             </div>
           </div>
@@ -391,7 +391,7 @@ export class ViewsHome extends React.Component<Record<string, never>, ViewsHomeS
     const examples = views.filter((v) => v.source === 'example');
 
     return (
-      <div className="views-home">
+      <ScrollRegion className="views-home">
         <div className={`views-home-backdrop ${BACKDROP_VARIANT}`} aria-hidden="true" />
         <div className="views-home-content">
           <div className="views-home-header">
@@ -435,7 +435,7 @@ export class ViewsHome extends React.Component<Record<string, never>, ViewsHomeS
             </>
           )}
         </div>
-      </div>
+      </ScrollRegion>
     );
   }
 }

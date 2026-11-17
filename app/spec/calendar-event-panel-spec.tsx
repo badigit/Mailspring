@@ -62,9 +62,8 @@ describe('EventPanel', function () {
     );
 
   // As TimePicker and DatePicker show them in the panel of an event we organize.
-  const pickerTime = (unix: number) => moment.unix(unix).format(DateUtils.localeTimeFormat());
-  const pickerDay = (unix: number) =>
-    moment.unix(unix).format(DateUtils.DATE_FORMAT_llll_NO_TIME).trim();
+  const pickerTime = (unix: number) => moment.unix(unix).format(DateUtils.tightTimeFormat());
+  const pickerDay = (unix: number) => DateUtils.dayString(moment.unix(unix));
 
   it("shows an invitation's times and day as an event we organize shows them", function () {
     render(invitation());
@@ -199,6 +198,33 @@ describe('EventPanel', function () {
       expect(buttons()).not.toContain('Yes');
       expect(proposalHint()).toBe(null);
       expect(host.textContent).toContain('This event has been cancelled');
+    });
+
+    it('names its conflicts, where it is given them, until answered Yes or No', function () {
+      const conflicts = [{ eventId: 'e2', title: 'Standup', start: START, end: START + 900 }];
+      const shownFor = (partstat: string, given = conflicts) => {
+        ReactDOM.render(
+          React.createElement(EventPanel, {
+            event: invitation({ attendees: [guests[0], { ...guests[1], partstat }] }),
+            isCalendarReadOnly: false,
+            onBack: () => {},
+            unsentChange: null,
+            onUnsentChange: () => {},
+            onSendUnsentChange: () => {},
+            onSaveChange: () => Promise.resolve(),
+            conflicts: given,
+          } as any),
+          host
+        );
+        return Array.from(host.querySelectorAll('.event-panel-conflict')).map((n) => n.textContent);
+      };
+
+      expect(shownFor('NEEDS-ACTION')[0]).toContain('Conflicts with Standup');
+      expect(shownFor('TENTATIVE').length).toBe(1);
+      expect(shownFor('ACCEPTED').length).toBe(0);
+      expect(shownFor('DECLINED').length).toBe(0);
+      // The calendar gives none: its grid already shows what overlaps.
+      expect(shownFor('NEEDS-ACTION', null).length).toBe(0);
     });
 
     describe('our answer', function () {

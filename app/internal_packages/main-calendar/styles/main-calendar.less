@@ -2,24 +2,6 @@
 @import 'ui-variables';
 @import 'ui-mixins';
 
-.attendee-status-colors() {
-  &.accepted .attendee-status {
-    background-color: #34c759;
-    color: white;
-  }
-
-  &.declined .attendee-status {
-    background-color: #ff3b30;
-    color: white;
-  }
-
-  &.tentative .attendee-status,
-  &.needs-action .attendee-status {
-    background-color: #8e8e93;
-    color: white;
-  }
-}
-
 .fixed-popover .calendar-event-popover {
   // The one action a read-only card offers. Drawn as a link rather than a .btn box so it
   // sits with the card's text instead of floating in a section of its own.
@@ -568,12 +550,18 @@
   // reach both ends. Any flex-grow ratio would still hand each spacer a sliver.
   flex: 1 1 100%;
   min-width: 0;
-  // The agenda toggle sits flush with the toolbar's end, as the mail sidebar toggle does.
   padding-left: 10px;
+  // Lines the agenda toggle's icon up with the agenda panel's new-event icon below it.
+  padding-right: 8px;
   color: @text-color-subtle;
 
-  .side-controls {
+  // The agenda's group spans the header's height, so only its controls opt out of dragging.
+  .side-controls,
+  .agenda-controls > * {
     -webkit-app-region: no-drag;
+  }
+  .side-controls,
+  .agenda-controls {
     display: flex;
     align-items: center;
     white-space: nowrap;
@@ -582,6 +570,27 @@
       flex-shrink: 0;
     }
     gap: 8px;
+  }
+
+  // With the agenda open, search and its toggle sit above it, so the header splits at its edge
+  // and a theme can colour each part as its column.
+  .agenda-controls {
+    margin-left: 8px;
+  }
+  &.agenda-split {
+    padding-right: 0;
+
+    .side-controls {
+      margin-right: 12px;
+    }
+    .agenda-controls {
+      align-self: stretch;
+      flex-shrink: 0;
+      box-sizing: border-box;
+      justify-content: flex-end;
+      margin-left: 0;
+      padding: 0 8px;
+    }
   }
 
   // The header centres its controls itself, so drop the toolbar's per-button offsets.
@@ -620,40 +629,19 @@
   }
 }
 
-// Event Search Bar - matches ThreadSearchBar styling
 .event-search-bar {
-  position: relative;
-  overflow: visible;
-  z-index: 100;
+  .search-bar();
   flex: 0 1 180px;
   min-width: 120px;
-  height: 23px;
-  font-weight: 400;
-  line-height: 23px;
-  background: @input-bg;
-  color: @text-color;
-  padding-left: @padding-xs-horizontal;
-  padding-right: @padding-xs-horizontal;
-  border-radius: @border-radius-base;
-  box-shadow: @shadow-border;
-  display: flex;
-  align-items: center;
 
   &.focused {
     box-shadow: 0 0 0 1px @accent-primary;
   }
 
   .search-accessory {
-    width: 15px;
-    height: 15px;
-    object-fit: contain;
-    zoom: 1 !important;
     flex-shrink: 0;
 
     &.clear {
-      color: @text-color-subtle;
-      width: 21px;
-      height: 21px;
       cursor: pointer;
     }
 
@@ -664,27 +652,7 @@
   }
 
   .event-search-input {
-    flex: 1;
-    height: 100%;
-    border: none;
-    background: transparent;
-    color: @text-color;
-    outline: none;
-    padding-left: @padding-xs-horizontal;
-    padding-right: @padding-xs-horizontal;
-    font-size: inherit;
-    line-height: inherit;
-    min-width: 0;
-
-    &:focus {
-      outline: none;
-      box-shadow: none;
-      border: none;
-    }
-
-    &::placeholder {
-      color: @text-color-very-subtle;
-    }
+    .search-bar-input();
   }
 
   // Wider than the field, which sits at the toolbar's right edge.
@@ -766,13 +734,17 @@
   }
 }
 
-// The macOS 26+ toolbar is taller and uses a capsule-shaped search field.
-:where(body.platform-darwin) .event-search-bar {
-  height: @toolbar-btn-height-darwin;
-  line-height: @toolbar-btn-height-darwin;
-  padding-left: @padding-base-horizontal;
-  padding-right: @padding-base-horizontal;
-  border-radius: (@toolbar-btn-height-darwin / 2);
+.sidebar-calendar-panel {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+
+  // The sidebar column draws the divider, as it does for the agenda below.
+  .event-panel {
+    border-left: none;
+  }
 }
 
 .mailspring-calendar.sidebar-agenda-panel {
@@ -796,11 +768,30 @@
   }
 }
 
+.agenda-in-this-email {
+  flex-shrink: 0;
+  margin-top: 4px;
+  padding: 8px;
+  border-top: 1px solid @border-color-divider;
+  border-bottom: 1px solid @border-color-divider;
+  background: color-mix(in srgb, @accent-primary 10%, @background-primary);
+
+  .agenda-in-this-email-label {
+    padding-bottom: 4px;
+    font-size: 12px;
+    line-height: 16px;
+    color: fadeout(@text-color, 35%);
+  }
+}
+
 .calendar-right-panel {
   position: relative;
   height: 100%;
+}
 
-  // The agenda under an open event keeps its layout, and so its scroll position.
+// The agenda under an open event keeps its layout, and so its scroll position.
+.calendar-right-panel,
+.sidebar-calendar-panel {
   .is-covered {
     visibility: hidden;
   }
@@ -849,14 +840,15 @@
     gap: 4px;
   }
 
-  .event-panel-more {
+  .event-panel-more,
+  .event-panel-view {
     width: 24px;
     height: 24px;
-    padding: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     color: @text-color-very-subtle;
+
+    img.content-mask {
+      background-color: @text-color-very-subtle;
+    }
   }
 
   .event-panel-body {
@@ -903,6 +895,18 @@
     }
   }
 
+  // Overhangs by the shadow, so the row doesn't move on hover. Times, dates and choices hover on
+  // their value alone.
+  .editable:hover,
+  .text-select:hover,
+  .event-panel-invitee-add .tokenizing-field-input:hover,
+  .time-picker-wrap input:hover,
+  .date-picker .day-text:hover {
+    border-radius: 2px;
+    background: @list-hover-bg;
+    box-shadow: 0 0 0 4px @list-hover-bg;
+  }
+
   // Times and dates break between their parts, rather than clipping, in a narrow panel.
   .event-panel-wrap {
     flex: 1;
@@ -940,27 +944,38 @@
     flex-direction: column;
   }
 
+  // Under the guests, at their names' indent, as small as the summary line.
+  .event-panel-invitees-toggle {
+    align-self: flex-start;
+    margin: 2px 0 0 26px;
+    padding: 2px 0;
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    color: fadeout(@text-color, 35%);
+
+    &:hover {
+      color: @text-color;
+    }
+  }
+
+  .event-panel-invitee-count {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 0;
+  }
+
+  // Each guest's dot sits in the icon column, so names line up with the other rows' text.
   .event-panel-invitee {
     display: flex;
     align-items: flex-start;
-    gap: 8px;
+    gap: 10px;
     padding: 4px 0;
     .attendee-status-colors();
+    .attendee-status-dot();
 
-    .attendee-status {
-      width: 12px;
-      height: 12px;
-      margin-top: 3px;
-      flex-shrink: 0;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-
-      svg {
-        width: 7px;
-        height: 7px;
-      }
+    > .event-panel-icon {
+      margin-top: 1px;
     }
   }
 
@@ -968,7 +983,7 @@
     flex: 1;
     min-width: 0;
 
-    .event-panel-rsvp {
+    .answer-section {
       margin-top: 4px;
     }
   }
@@ -1000,15 +1015,9 @@
     visibility: hidden;
   }
 
+  // Only the remove button shows: the row itself does nothing on click, so it takes no fill.
   .event-panel-invitee.removable:hover,
   .event-panel-invitee.removable:focus-within {
-    .event-panel-invitee-line {
-      margin: -4px -4px -4px -8px;
-      padding: 4px 4px 4px 8px;
-      border-radius: 3px;
-      background: @list-hover-bg;
-    }
-
     .event-panel-invitee-remove {
       visibility: visible;
     }
@@ -1027,7 +1036,6 @@
 
   .event-panel-invitee-add {
     .attendee-status {
-      margin-top: 7px;
       color: @text-color-very-subtle;
     }
 
@@ -1042,14 +1050,42 @@
       min-width: 0;
     }
 
-    // Pulled left so the text lines up with the guest names; the fill overhangs the 26px row.
+    // Without the token field's own label indent and padding, to sit like a guest's name.
     .tokenizing-field-input {
-      .calendar-field();
-      margin: -2px 0 -2px -8px;
+      position: relative;
+      display: flex;
+      align-items: center;
+      margin: 0;
+      padding: 0;
+
+      &:has(.clear-button) {
+        padding-right: 22px;
+      }
+
+      input {
+        flex: 1;
+        min-width: 0;
+        height: auto;
+      }
+
+      .clear-button {
+        position: absolute;
+        top: 50%;
+        right: 0;
+        width: 18px;
+        height: 18px;
+        transform: translateY(-50%);
+        color: @text-color;
+        opacity: 0.5;
+
+        &:hover {
+          opacity: 1;
+        }
+      }
     }
 
     .placeholder {
-      left: 8px;
+      left: 0;
       color: @text-color-very-subtle;
     }
   }
@@ -1062,15 +1098,21 @@
     white-space: nowrap;
   }
 
+  // The rest of the row, so the hover stops short of the icon only.
+  .event-panel-location {
+    flex: 1;
+  }
+
   .event-panel-notes {
     white-space: pre-line;
     overflow-wrap: anywhere;
   }
 
   // Fields read as text until they're focused, as on the design.
-  input.event-panel-title,
+  .event-panel-title input,
   input.event-panel-location,
   textarea.event-panel-notes,
+  .event-panel-invitee-add input,
   .time-picker-wrap input,
   select {
     border: none;
@@ -1085,20 +1127,19 @@
     }
   }
 
+  .event-panel-title input,
   input.event-panel-location,
   textarea.event-panel-notes,
+  .event-panel-invitee-add input,
   .time-picker-wrap input,
   select {
     padding: 0;
     font: inherit;
   }
 
-  input.event-panel-title {
+  .event-panel-title input {
     width: 100%;
     height: auto;
-    box-sizing: border-box;
-    border-bottom: 1px solid @border-color-divider;
-    font-family: inherit;
   }
 
   input.event-panel-location,
@@ -1112,27 +1153,17 @@
     overflow: hidden;
   }
 
-  .event-panel-select {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
+  .event-panel-conflict {
+    align-items: flex-start;
+    min-height: 0;
+    padding: 2px 0 4px;
+    font-size: 12px;
+    line-height: 16px;
+    color: @color-error;
 
-    select {
-      appearance: none;
-      field-sizing: content;
-      padding-right: 14px;
-    }
-
-    img.content-mask {
-      position: absolute;
-      right: 0;
-      pointer-events: none;
-      visibility: hidden;
-      background-color: @text-color-very-subtle;
-    }
-
-    &:hover img.content-mask {
-      visibility: visible;
+    .event-panel-icon {
+      margin-top: 1px;
+      color: @color-error;
     }
   }
 
@@ -1144,11 +1175,27 @@
     }
   }
 
+  // As tall as its six weeks, so the padding holds at the bottom too.
+  .date-picker .mini-month-view {
+    box-sizing: border-box;
+    height: auto;
+    min-height: 0;
+    padding: 6px;
+    border-radius: 8px;
+  }
+
+  // As the time lists: under the field with a gap. DatePicker keeps it inside the panel.
+  .date-picker .mini-month-view-wrap {
+    top: calc(100% + 8px);
+    height: auto;
+  }
+
   .time-picker-wrap {
     width: auto;
 
     input {
-      width: 5em;
+      width: auto;
+      field-sizing: content;
     }
   }
 
@@ -1207,7 +1254,7 @@
 
   .event-panel-answer {
     gap: 8px;
-    background: color-mix(in srgb, @accent-primary 6%, @background-primary);
+    background: color-mix(in srgb, @accent-primary 10%, @background-primary);
   }
 
   .event-panel-change {
@@ -1282,50 +1329,6 @@
   // 2px from the time row, against the section's usual gap.
   .event-panel-proposal-hint {
     margin-bottom: -2px;
-  }
-
-  // Your answer is filled as the invitation header fills it.
-  // One outline around the group with hairline dividers, like Activity's segmented control.
-  .event-panel-rsvp {
-    display: flex;
-    border-radius: @border-radius-base;
-    .btn-hairline();
-
-    .btn {
-      flex: 1;
-      min-width: 0;
-      padding: 0 8px;
-      box-shadow: none;
-
-      & + .btn {
-        box-shadow: -0.5px 0 0 @btn-border-color;
-      }
-
-      &:not(:last-child) {
-        border-right: 0;
-        border-top-right-radius: 0;
-        border-bottom-right-radius: 0;
-      }
-      &:not(:first-child) {
-        border-top-left-radius: 0;
-        border-bottom-left-radius: 0;
-      }
-    }
-
-    .btn.ACCEPTED {
-      background: @color-success;
-      color: @white;
-    }
-
-    .btn.TENTATIVE {
-      background: @gray-light;
-      color: @white;
-    }
-
-    .btn.DECLINED {
-      background: @color-error;
-      color: @white;
-    }
   }
 
   .event-panel-calendar-swatch {

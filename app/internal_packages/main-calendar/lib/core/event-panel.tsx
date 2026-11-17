@@ -1,16 +1,19 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
+import moment from 'moment-timezone';
 import {
   localized,
   isRTL,
   AccountStore,
   Autolink,
   Calendar,
+  CalendarConflict,
   CalendarDate,
   CalendarDateUtils,
   CalendarUtils,
   Contact,
   DatabaseStore,
+  Rx,
   DateUtils,
   Event,
   ICSEventHelpers,
@@ -18,14 +21,23 @@ import {
   Utils,
 } from 'mailspring-exports';
 import {
+  AnswerSection,
   DatePicker,
   RetinaImg,
   ScrollRegion,
   SVGIcons,
   Switch,
+  TextSelect,
   TimePicker,
 } from 'mailspring-component-kit';
-import { EventOccurrence, EventAttendee, isTimed, occurrenceTimes } from './calendar-data-source';
+import {
+  EventOccurrence,
+  EventAttendee,
+  isOffCalendar,
+  isTimed,
+  occurrenceStartUnix,
+  occurrenceTimes,
+} from './calendar-data-source';
 import {
   allDayToggleTimes,
   asksGuestShowAsScope,
@@ -34,36 +46,46 @@ import {
   clampEnd,
   editableFields,
   extractNotesFromDescription,
+  fieldZone,
+  formatConflict,
   formatShortTimeRange,
-  formatTime,
   hasGuests,
   holdsEdits,
   proposesTime,
   inclusiveAllDayEnd,
   momentOf,
   PanelField,
+  sameWallClockIn,
   shiftEndWithStart,
 } from './calendar-helpers';
-import { AttendeeStatusIcon, attendeeStatusClass, sortedAttendees } from './attendee-status';
+import {
+  AttendeeStatusIcon,
+  attendeeStatusClass,
+  contactNamesByEmail,
+  guestCount,
+  guestName,
+  guestSummary,
+  sortedAttendees,
+} from './attendee-status';
 import {
   RepeatOption,
   frequencyToRepeatOption,
   repeatLabel,
   repeatOptionToRRule,
 } from './repeat-selector';
-import { formatTimezone } from './timezone-selector';
+import { COMMON_TIMEZONES, formatTimezone } from './timezone-selector';
 import { ShowAsOption, showAsLabel } from './show-as-selector';
 import {
   canRespondToEvent,
+  isAnsweredYesOrNo,
   isOrganizer,
   myAttendeeEmail,
   myParticipationStatus,
   proposedTimesFor,
   ProposedTime,
   respondToCalendarEvent,
-  rsvpActions,
 } from './calendar-rsvp';
-import { ChangeScope, EventPropertyEdit } from './recurring-event-actions';
+import { ChangeScope, EventChange, EventPropertyEdit } from './recurring-event-actions';
 import { EventPanelTextField } from './event-panel-text-field';
 import {
   UnsentChange,
@@ -84,13 +106,13 @@ const REPEAT_OPTIONS: RepeatOption[] = ['none', 'daily', 'weekly', 'monthly', 'y
 const repeatOptionLabel = (option: RepeatOption) =>
   option === 'none' ? localized('Does not repeat') : repeatLabel(option);
 
-function daysLabel(first: CalendarDate, last: CalendarDate) {
-  const from = momentOf(first).format('ddd MMM D');
-  return first === last ? from : `${from} – ${momentOf(last).format('ddd MMM D')}`;
-}
+const formatDay = (day: CalendarDate) => DateUtils.dayString(momentOf(day));
 
-const formatDay = (day: CalendarDate) =>
-  momentOf(day).format(DateUtils.DATE_FORMAT_llll_NO_TIME).trim();
+const formatPickerTime = (unix: number) => moment.unix(unix).format(DateUtils.tightTimeFormat());
+
+function daysLabel(first: CalendarDate, last: CalendarDate) {
+  return first === last ? formatDay(first) : `${formatDay(first)} – ${formatDay(last)}`;
+}
 
 // As the date pickers show them, so an event that can't be edited reads like one that can.
 function renderDays(first: CalendarDate, last: CalendarDate) {
@@ -103,6 +125,9 @@ function renderDays(first: CalendarDate, last: CalendarDate) {
   );
 }
 const SHOW_AS_OPTIONS: ShowAsOption[] = ['OPAQUE', 'TRANSPARENT'];
+
+// A longer guest list shows this many, organizer and you first, until it's expanded.
+const TRIMMED_GUEST_ROWS = 5;
 
 interface EventPanelProps {
   event: EventOccurrence;
@@ -121,13 +146,11 @@ interface EventPanelProps {
   onDiscard?: () => void;
   calendarChoices?: Calendar[];
   onCalendarChange?: (calendar: Calendar) => void;
+  /** Given in the mail sidebar, where an invitation is answered; the calendar shows the clash. */
+  conflicts?: CalendarConflict[];
 }
 
-interface Times {
-  start: number;
-  end: number;
-  isAllDay: boolean;
-}
+type Times = NonNullable<EventChange['times']>;
 
 interface ChangeRow {
   key: string;
@@ -142,11 +165,16 @@ type InviteeState = 'removed' | 'removable' | 'answerable' | '';
 interface EventPanelState {
   /** Read from the event's row: the occurrence doesn't carry it. */
   repeat: RepeatOption;
+  /** Read from the event's row; null for a time in UTC, floating or an event not yet created. */
+  timezone: string | null;
   /** Times changed in the panel, shown until the saved event comes back. */
   times: Times | null;
   proposals: ProposedTime[];
   /** Your guest row's answer buttons are showing. */
   answerOpen: boolean;
+  allGuestsShown: boolean;
+  /** Shown only: the guest list an edit writes back keeps the invitation's own names. */
+  contactNames: Map<string, string>;
 }
 
 /** Text with its links live, as notes show when not being edited. */
@@ -170,19 +198,6 @@ class AutolinkedText extends React.Component<{ text: string }> {
   }
 }
 
-// A select that reads as text, as the toolbar's view picker does, with the caret only on hover.
-const PanelSelect = (props: React.SelectHTMLAttributes<HTMLSelectElement>) => (
-  <span className="event-panel-select">
-    <select {...props} />
-    <RetinaImg
-      name="ic-calendar-down-arrow.png"
-      mode={RetinaImg.Mode.ContentIsMask}
-      style={{ width: 8, height: 5, WebkitMaskSize: 'contain' }}
-      aria-hidden="true"
-    />
-  </span>
-);
-
 function linkOrText(location: string) {
   return location.startsWith('http') || location.startsWith('tel:') ? (
     <a href={location}>{location}</a>
@@ -195,7 +210,15 @@ function linkOrText(location: string) {
 export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelState> {
   static displayName = 'EventPanel';
 
-  state: EventPanelState = { repeat: 'none', times: null, proposals: [], answerOpen: false };
+  state: EventPanelState = {
+    repeat: 'none',
+    timezone: null,
+    times: null,
+    proposals: [],
+    answerOpen: false,
+    allGuestsShown: false,
+    contactNames: new Map(),
+  };
 
   _el = React.createRef<HTMLElement>();
   _title = React.createRef<EventPanelTextField>();
@@ -210,16 +233,23 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
   _timesSaveLanded = false;
   _timesSaveCount = 0;
   _proposalsKey: string | null = null;
+  _contactNamesKey = '';
+  _contactNamesSub: { dispose(): void } | null = null;
 
   componentDidMount() {
     this._loadEventRow();
+    this._watchContactNames();
+  }
+
+  componentWillUnmount() {
+    this._contactNamesSub?.dispose();
   }
 
   // A focused answer button that closes or turns off would leave focus on the page, where Esc
   // can't close the panel.
   getSnapshotBeforeUpdate() {
     const focused = document.activeElement as HTMLButtonElement | null;
-    const answering = focused?.closest('.event-panel-answer, .event-panel-rsvp');
+    const answering = focused?.closest('.event-panel-answer, .answer-section');
     return answering && this._el.current?.contains(focused) ? focused : null;
   }
 
@@ -238,15 +268,46 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
       const { times } = this.state;
       if (times && !this._pendingTimes && (this._timesSaveLanded || this._storedTimesAre(times))) {
         this._timesSaveLanded = false;
-        this.setState({ times: null });
+        // The zone too, until the row is read, so the new times aren't drawn in the old zone.
+        this.setState({ times: null, ...(times.timezone && { timezone: times.timezone }) });
       }
       this._loadEventRow();
     }
+    this._watchContactNames();
   }
 
-  _storedTimesAre({ start, end, isAllDay }: Times) {
+  _watchContactNames() {
+    const { event, unsentChange } = this.props;
+    const people = [...event.attendees, ...(unsentChange?.attendees?.added ?? [])];
+    if (event.organizer) people.push(event.organizer);
+    // Mail contacts are stored lowercased, address-book ones as typed, and IN matches case.
+    const unnamed = people.filter((p) => !p.name).map((p) => p.email);
+    const emails = [...new Set([...unnamed, ...unnamed.map((e) => e.toLowerCase())])];
+    const key = emails.sort().join('\n');
+    if (key === this._contactNamesKey) return;
+    this._contactNamesKey = key;
+    this._contactNamesSub?.dispose();
+    this._contactNamesSub = null;
+    if (!emails.length) {
+      this.setState({ contactNames: new Map() });
+      return;
+    }
+    const query = DatabaseStore.findAll<Contact>(Contact)
+      .where(Contact.attributes.email.in(emails))
+      .where(Contact.attributes.hidden.equal(false));
+    this._contactNamesSub = Rx.Observable.fromQuery(query).subscribe((contacts) =>
+      this.setState({ contactNames: contactNamesByEmail(contacts) })
+    );
+  }
+
+  _storedTimesAre({ start, end, isAllDay, timezone }: Times) {
     const stored = this._storedTimes();
-    return stored.start === start && stored.end === end && stored.isAllDay === isAllDay;
+    return (
+      stored.start === start &&
+      stored.end === end &&
+      stored.isAllDay === isAllDay &&
+      (timezone ?? this._storedZone()) === this._storedZone()
+    );
   }
 
   focusTitle() {
@@ -300,6 +361,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
     if (this.props.event !== occurrence || !row) return;
     this.setState({
       repeat: frequencyToRepeatOption(ICSEventHelpers.getRecurrenceInfo(row.ics).frequency),
+      timezone: ICSEventHelpers.getEventTimezone(row.ics),
     });
     this._loadProposals(occurrence, row);
   }
@@ -400,6 +462,25 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
     return occurrenceTimes(this.props.event);
   }
 
+  _storedZone() {
+    return this.state.timezone ?? DateUtils.timeZone;
+  }
+
+  _shownZone() {
+    return this._times().timezone ?? this._storedZone();
+  }
+
+  /** Where the event's zone can be changed its times read in it; elsewhere in yours (undefined). */
+  _zoneOf(times: Times): string | undefined {
+    if (times.isAllDay || !this._canEdit('timezone')) return undefined;
+    return fieldZone(times.timezone ?? this._storedZone());
+  }
+
+  // An occurrence changed on its own can't have a zone of its own (createRecurrenceException).
+  _canChangeZone() {
+    return this._canEdit('timezone') && !this.props.event.isException;
+  }
+
   _changeTimes(times: Times) {
     this._pendingTimes = times;
     this.setState({ times });
@@ -453,13 +534,33 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
   // From the days on screen, which may be picked but not yet saved.
   _onAllDayChange = () => {
     const t = this._times();
-    const days = {
-      startDate: CalendarDateUtils.calendarDateFromUnix(t.start),
-      endDate: this._lastDay(t),
-    };
-    this._changeTimes({ ...allDayToggleTimes(days, !t.isAllDay), isAllDay: !t.isAllDay });
+    const days = { startDate: this._firstDay(t), endDate: this._lastDay(t) };
+    // Switched off, 9 AM lands in the zone the fields will read it in.
+    const zone = this._zoneOf({ ...t, isAllDay: false });
+    this._changeTimes({ ...allDayToggleTimes(days, !t.isAllDay, zone), isAllDay: !t.isAllDay });
     this._saveTimes();
   };
+
+  // The times keep the wall clock they show, so the event moves.
+  _onTimezoneChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const timezone = e.target.value;
+    const t = this._times();
+    const from = this._zoneOf(t) ?? DateUtils.timeZone;
+    const to = fieldZone(timezone);
+    this._changeTimes({
+      start: sameWallClockIn(t.start, from, to),
+      end: sameWallClockIn(t.end, from, to),
+      isAllDay: false,
+      ...(timezone !== this._storedZone() && { timezone }),
+    });
+    this._saveTimes();
+  };
+
+  _zoneChoices() {
+    return [
+      ...new Set([this._shownZone(), this._storedZone(), DateUtils.timeZone, ...COMMON_TIMEZONES]),
+    ];
+  }
 
   _onRepeatChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const repeat = e.target.value as RepeatOption;
@@ -499,12 +600,12 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
           {this.props.headerActions}
           {this.props.onDelete && (
             <button
-              className="btn-bare event-panel-more"
+              className="btn-ghost event-panel-more"
               title={localized('More')}
               aria-label={localized('More')}
               onClick={this._onMore}
             >
-              <SVGIcons.More />
+              <SVGIcons.More size={22} />
             </button>
           )}
         </div>
@@ -519,7 +620,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
       return (
         <EventPanelTextField
           ref={this._title}
-          className="event-panel-title"
+          className="editable"
           value={this._shown('summary', event.title)}
           placeholder={localized('New Event')}
           // Left empty, an unsaved event keeps no title, so leaving it doesn't create it.
@@ -532,22 +633,30 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
         />
       );
     }
-    return <div className="event-panel-title">{event.isCancelled ? <s>{title}</s> : title}</div>;
+    return isOffCalendar(event) ? <s>{title}</s> : title;
+  }
+
+  _firstDay(times: Times) {
+    return CalendarDateUtils.calendarDateFromUnix(times.start, this._zoneOf(times));
   }
 
   /** The last day the times cover: a timed event ending at midnight doesn't reach the next day. */
-  _lastDay({ start, end, isAllDay }: Times) {
+  _lastDay(times: Times) {
+    const { start, end, isAllDay } = times;
     return CalendarDateUtils.calendarDateFromUnix(
-      isAllDay ? inclusiveAllDayEnd(end) : Math.max(end - 1, start)
+      isAllDay ? inclusiveAllDayEnd(end) : Math.max(end - 1, start),
+      this._zoneOf(times)
     );
   }
 
   _renderEditableWhen() {
     const t = this._times();
-    const multiDay = CalendarDateUtils.calendarDateFromUnix(t.start) !== this._lastDay(t);
+    const zone = this._zoneOf(t);
+    const multiDay = this._firstDay(t) !== this._lastDay(t);
     const endDatePicker = (
       <DatePicker
         value={(t.isAllDay ? inclusiveAllDayEnd(t.end) : t.end) * 1000}
+        timeZone={zone}
         onChange={(ms) =>
           this._changeEnd(
             t.isAllDay
@@ -589,11 +698,12 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
           <div className={`event-panel-row ${allDaySwitch ? 'indented' : ''}`}>
             {!allDaySwitch && clock}
             <div className="event-panel-wrap">
-              <TimePicker value={t.start * 1000} onChange={this._changeStart} />
+              <TimePicker value={t.start * 1000} timeZone={zone} onChange={this._changeStart} />
               <SVGIcons.ArrowRight className="event-panel-icon" />
               <TimePicker
                 value={t.end * 1000}
                 relativeTo={t.start * 1000}
+                timeZone={zone}
                 onChange={(ms) => this._changeEnd(ms / 1000)}
               />
               <span className="event-panel-subtle">
@@ -605,19 +715,37 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
         <div className={`event-panel-row ${allDaySwitch || !t.isAllDay ? 'indented' : ''}`}>
           {!allDaySwitch && t.isAllDay && clock}
           <div className="event-panel-wrap">
-            <DatePicker value={t.start * 1000} onChange={this._changeStart} />
+            <DatePicker value={t.start * 1000} timeZone={zone} onChange={this._changeStart} />
             {multiDay && <span>–</span>}
             {multiDay && endDatePicker}
           </div>
         </div>
+        {this._renderYourTime(t)}
+        {this._renderConflicts()}
         {!allDaySwitch && t.isAllDay && (
           <div className="event-panel-row indented">{localized('All day')}</div>
         )}
         {!t.isAllDay && (
           <div className="event-panel-row">
             <SVGIcons.Globe className="event-panel-icon" />
-            {/* The zone the times above are shown in, which may not be the event's own. */}
-            {formatTimezone(DateUtils.timeZone)}
+            {this._canChangeZone() ? (
+              <TextSelect
+                value={this._shownZone()}
+                aria-label={localized('Time zone')}
+                onChange={this._onTimezoneChange}
+              >
+                {this._zoneChoices().map((timezone) => (
+                  <option key={timezone} value={timezone}>
+                    {formatTimezone(timezone, t.start)}
+                  </option>
+                ))}
+              </TextSelect>
+            ) : (
+              formatTimezone(
+                this._canEdit('timezone') ? this._shownZone() : DateUtils.timeZone,
+                t.start
+              )
+            )}
           </div>
         )}
         {/* An occurrence changed on its own takes no scope; its rule is the series'. */}
@@ -626,17 +754,46 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
         ) : (
           <div className="event-panel-row">
             <SVGIcons.Repeat className="event-panel-icon" />
-            <PanelSelect value={this._repeat()} onChange={this._onRepeatChange}>
+            <TextSelect value={this._repeat()} onChange={this._onRepeatChange}>
               {REPEAT_OPTIONS.map((option) => (
                 <option key={option} value={option}>
                   {repeatOptionLabel(option)}
                 </option>
               ))}
-            </PanelSelect>
+            </TextSelect>
           </div>
         )}
       </div>
     );
+  }
+
+  _renderYourTime(times: Times) {
+    const zone = this._zoneOf(times);
+    if (!zone || zone === DateUtils.timeZone) return null;
+    const shownDays = daysLabel(this._firstDay(times), this._lastDay(times));
+    const yourDays = daysLabel(
+      CalendarDateUtils.calendarDateFromUnix(times.start),
+      CalendarDateUtils.calendarDateFromUnix(Math.max(times.end - 1, times.start))
+    );
+    const range = formatShortTimeRange(times.start, times.end);
+    return (
+      <div className="event-panel-row indented event-panel-subtle">
+        {localized('%@ your time', yourDays === shownDays ? range : `${yourDays}, ${range}`)}
+      </div>
+    );
+  }
+
+  // Gone once answered Yes or No, as the answer section is.
+  _renderConflicts() {
+    const { conflicts, event } = this.props;
+    const answered = isAnsweredYesOrNo(myParticipationStatus(event));
+    if (!conflicts?.length || !canRespondToEvent(event) || answered) return null;
+    return conflicts.map((c) => (
+      <div className="event-panel-row event-panel-conflict" key={`${c.eventId}-${c.start}`}>
+        <SVGIcons.AlertTriangle className="event-panel-icon" />
+        {localized('Conflicts with %@', formatConflict(c, occurrenceStartUnix(event)))}
+      </div>
+    ));
   }
 
   _renderRepeatLabel() {
@@ -664,20 +821,20 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
             <div className="event-panel-row">
               <SVGIcons.Clock className="event-panel-icon" />
               <div className="event-panel-wrap">
-                {/* As the time pickers show them. */}
-                <span>{formatTime(event.start)}</span>
+                <span>{formatPickerTime(event.start)}</span>
                 <SVGIcons.ArrowRight className="event-panel-icon" />
-                <span>{formatTime(event.end)}</span>
+                <span>{formatPickerTime(event.end)}</span>
                 <span className="event-panel-subtle">
                   {DateUtils.formatDuration(event.end - event.start)}
                 </span>
               </div>
             </div>
             <div className="event-panel-row indented">{days}</div>
+            {this._renderConflicts()}
             <div className="event-panel-row">
               <SVGIcons.Globe className="event-panel-icon" />
               {/* The zone the times above are shown in, which may not be the event's own. */}
-              {formatTimezone(DateUtils.timeZone)}
+              {formatTimezone(DateUtils.timeZone, event.start)}
             </div>
           </>
         ) : (
@@ -687,6 +844,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
               {days}
             </div>
             <div className="event-panel-row indented">{localized('All day')}</div>
+            {this._renderConflicts()}
           </>
         )}
         {this._renderRepeatLabel()}
@@ -715,7 +873,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
   }
 
   _renderInvitee(attendee: EventAttendee, state: InviteeState, me: string | null) {
-    const name = attendee.name || attendee.email;
+    const name = guestName(attendee, this.state.contactNames);
     const answerable = state === 'answerable';
     const { answerOpen } = this.state;
     return (
@@ -723,20 +881,20 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
         key={attendee.email}
         className={`event-panel-invitee ${attendeeStatusClass(attendee)} ${state}`}
       >
-        <span className="attendee-status">
-          <AttendeeStatusIcon attendee={attendee} />
+        <span className="event-panel-icon">
+          <span className="attendee-status">
+            <AttendeeStatusIcon attendee={attendee} />
+          </span>
         </span>
         <div className="event-panel-invitee-body">
           <div className="event-panel-invitee-line">
             <div className="event-panel-invitee-name">
-              <div title={new Contact({ name: attendee.name, email: attendee.email }).toString()}>
-                {name}
-              </div>
+              <div title={new Contact({ name, email: attendee.email }).toString()}>{name}</div>
               {this._renderInviteeRole(attendee, me)}
             </div>
             {state === 'removable' && (
               <button
-                className="btn-bare event-panel-invitee-remove"
+                className="btn-ghost event-panel-invitee-remove"
                 title={localized('Remove %@', name)}
                 aria-label={localized('Remove %@', name)}
                 onClick={() => this._removeAttendee(attendee)}
@@ -756,7 +914,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
               </button>
             )}
           </div>
-          {answerable && answerOpen && this._renderAnswerButtons(false)}
+          {answerable && answerOpen && this._renderAnswerSection(false)}
         </div>
       </div>
     );
@@ -788,29 +946,61 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
       return editable && !ours ? 'removable' : '';
     };
     const listed = attendees.length > 0 || added.length > 0;
-    return (
-      <div className="event-panel-row top">
-        <SVGIcons.Person className="event-panel-icon" />
-        <div className="event-panel-invitees">
-          {sortedAttendees(this.props.event).map((a) => this._renderInvitee(a, stateOf(a), me))}
-          {added.map((a) => this._renderInvitee(a, stateOf(a), me))}
-          {editable && (
-            <div className="event-panel-invitee event-panel-invitee-add">
-              {listed && (
-                <span className="attendee-status">
-                  <SVGIcons.Plus size={12} />
-                </span>
-              )}
-              <EventAttendeesInput
-                className="event-panel-invitee-input"
-                attendees={[]}
-                placeholder={localized('Add Invitees')}
-                change={this._addAttendees}
-                clearable
-              />
-            </div>
-          )}
+    const addInvitees = editable && (
+      <div className="event-panel-invitee event-panel-invitee-add">
+        {listed && (
+          <span className="event-panel-icon">
+            <span className="attendee-status">
+              <SVGIcons.Plus size={12} />
+            </span>
+          </span>
+        )}
+        <EventAttendeesInput
+          className="event-panel-invitee-input"
+          attendees={[]}
+          placeholder={localized('Add Invitees')}
+          change={this._addAttendees}
+          clearable
+        />
+      </div>
+    );
+    if (!listed) {
+      return (
+        <div className="event-panel-row">
+          <SVGIcons.Person className="event-panel-icon" />
+          <div className="event-panel-invitees">{addInvitees}</div>
         </div>
+      );
+    }
+    const invited = sortedAttendees(this.props.event, this.state.contactNames);
+    const guests = [...invited, ...added];
+    const counted = guests.filter((a) => stateOf(a) !== 'removed');
+    const { allGuestsShown } = this.state;
+    const trims = invited.length > TRIMMED_GUEST_ROWS;
+    // Guests just added always show, so one never disappears into the hidden rows.
+    const shown = trims && !allGuestsShown ? invited.slice(0, TRIMMED_GUEST_ROWS) : invited;
+    // One block, so the section's gap between rows doesn't fall between the count and the guests.
+    return (
+      <div className="event-panel-invitees">
+        <div className="event-panel-row top">
+          <SVGIcons.Person className="event-panel-icon" />
+          <div className="event-panel-invitee-count">
+            <div>{guestCount(counted.length)}</div>
+            <div className="event-panel-subtle">{guestSummary(counted)}</div>
+          </div>
+        </div>
+        {[...shown, ...added].map((a) => this._renderInvitee(a, stateOf(a), me))}
+        {addInvitees}
+        {trims && (
+          <button
+            className="btn-bare event-panel-invitees-toggle"
+            onClick={() => this.setState({ allGuestsShown: !allGuestsShown })}
+          >
+            {allGuestsShown
+              ? localized('Show less')
+              : localized('Show %@ more', invited.length - TRIMMED_GUEST_ROWS)}
+          </button>
+        )}
       </div>
     );
   }
@@ -819,7 +1009,9 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
     const isMe = !!me && Utils.emailIsEquivalent(attendee.email, me);
     let role: string = null;
     if (isOrganizer(this.props.event, attendee)) {
-      role = isMe ? localized('Organizer · You') : localized('Organizer');
+      // An organizer left off the guest list isn't found as `me`; isMine says it's us.
+      role =
+        isMe || this.props.event.isMine ? localized('Organizer · You') : localized('Organizer');
     } else if (isMe) {
       role = localized('You');
     }
@@ -847,7 +1039,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
           <div className="event-panel-row">
             {this._renderLocationIcon(shownLocation)}
             <EventPanelTextField
-              className="event-panel-location"
+              className="event-panel-location editable"
               value={shownLocation}
               placeholder={localized('Add Location or Video Call')}
               display={shownLocation && linkOrText(shownLocation)}
@@ -873,7 +1065,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
       return (
         <div className="event-panel-section">
           <EventPanelTextField
-            className="event-panel-notes"
+            className="event-panel-notes editable"
             multiline
             value={shownNotes}
             placeholder={localized('Add notes or URL...')}
@@ -895,18 +1087,18 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
     const { event, onCalendarChange } = this.props;
     const byAccount = new Map<string, Calendar[]>();
     for (const c of choices) byAccount.set(c.accountId, [...(byAccount.get(c.accountId) ?? []), c]);
-    // A closed select shows only the option, and accounts often each have a "Calendar".
-    const shared = (c: Calendar) => choices.some((o) => o !== c && o.name === c.name);
     const options = (calendars: Calendar[]) =>
       calendars.map((c) => (
         <option key={c.id} value={c.id}>
-          {shared(c) ? `${c.name} · ${AccountStore.accountForId(c.accountId)?.label}` : c.name}
+          {c.name}
         </option>
       ));
     return (
-      <PanelSelect
+      <TextSelect
         value={event.calendarId}
         aria-label={localized('Calendar')}
+        // Accounts often each have a "Calendar", which the closed select can't tell apart.
+        title={AccountStore.accountForId(event.accountId)?.label}
         onChange={(e) => onCalendarChange?.(choices.find((c) => c.id === e.target.value))}
       >
         {byAccount.size > 1
@@ -916,7 +1108,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
               </optgroup>
             ))
           : options(choices)}
-      </PanelSelect>
+      </TextSelect>
     );
   }
 
@@ -938,7 +1130,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
         )}
         <div className="event-panel-row indented">
           {this._canSetShowAs() ? (
-            <PanelSelect
+            <TextSelect
               value={this._shown('transp', showAs)}
               onChange={(e) => this._saveProperty({ property: 'transp', value: e.target.value })}
             >
@@ -947,7 +1139,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
                   {showAsLabel(option)}
                 </option>
               ))}
-            </PanelSelect>
+            </TextSelect>
           ) : (
             showAsLabel(showAs)
           )}
@@ -956,12 +1148,15 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
     );
   }
 
+  // In the zone each reads in, named when the change moves the event to another.
   _timesLabel(times: Times, other: Times) {
-    const days = (t: Times) =>
-      daysLabel(CalendarDateUtils.calendarDateFromUnix(t.start), this._lastDay(t));
+    const days = (t: Times) => daysLabel(this._firstDay(t), this._lastDay(t));
     if (times.isAllDay) return days(times);
-    const range = formatShortTimeRange(times.start, times.end);
-    return days(times) === days(other) ? range : `${days(times)}, ${range}`;
+    const zone = this._zoneOf(times);
+    const range = formatShortTimeRange(times.start, times.end, zone);
+    const label = days(times) === days(other) ? range : `${days(times)}, ${range}`;
+    if (other.isAllDay || zone === this._zoneOf(other)) return label;
+    return `${label} ${formatTimezone(times.timezone ?? this._storedZone(), times.start)}`;
   }
 
   _changeRows(change: UnsentChange) {
@@ -979,7 +1174,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
     }
     if (change.attendees) {
       const names = (attendees: EventAttendee[]) =>
-        attendees.map((a) => a.name || a.email).join(', ');
+        attendees.map((a) => guestName(a, this.state.contactNames)).join(', ');
       rows.push({
         key: 'attendees',
         icon: <SVGIcons.Person />,
@@ -1208,10 +1403,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
       <div className={`event-panel-collapse ${away ? 'collapsed' : ''}`} aria-hidden={away}>
         <div>
           <div className="event-panel-section event-panel-answer">
-            {savedTo && (
-              <div className="event-panel-subtle">{localized('Saved to %@', calendar.name)}</div>
-            )}
-            {this._renderAnswerButtons(away)}
+            {this._renderAnswerSection(away, savedTo && localized('Saved to %@', calendar.name))}
           </div>
         </div>
       </div>
@@ -1222,33 +1414,17 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
   // guest row then changes; and while a change waits, so an answer and a new time aren't both sent.
   _answerSectionAway() {
     const { event, isCalendarReadOnly, unsentChange } = this.props;
-    return (
-      isCalendarReadOnly ||
-      !!unsentChange ||
-      ['ACCEPTED', 'DECLINED'].includes(myParticipationStatus(event))
-    );
+    return isCalendarReadOnly || !!unsentChange || isAnsweredYesOrNo(myParticipationStatus(event));
   }
 
-  _renderAnswerButtons(disabled: boolean) {
-    const answer = myParticipationStatus(this.props.event);
+  _renderAnswerSection(disabled: boolean, note?: string) {
     return (
-      <div
-        className="event-panel-rsvp button-group"
-        role="group"
-        aria-label={localized('Your response')}
-      >
-        {rsvpActions().map(([status, label]) => (
-          <button
-            key={status}
-            className={`btn ${status === answer ? status : ''}`}
-            aria-pressed={status === answer}
-            disabled={disabled}
-            onClick={() => this._answer(status)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <AnswerSection
+        note={note}
+        answer={myParticipationStatus(this.props.event)}
+        disabled={disabled}
+        onAnswer={(status) => this._answer(status)}
+      />
     );
   }
 
@@ -1278,7 +1454,7 @@ export class EventPanel extends React.PureComponent<EventPanelProps, EventPanelS
       >
         {this._renderHeader()}
         <ScrollRegion className="event-panel-body">
-          {this._renderTitle()}
+          <div className="event-panel-title">{this._renderTitle()}</div>
           {this._renderRsvp()}
           {this._renderProposals()}
           {this._renderWhen()}

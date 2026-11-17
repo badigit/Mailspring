@@ -113,8 +113,9 @@ export function generateUID(): string {
  * cap is worse - an invitation is untrusted input, and `RRULE:FREQ=SECONDLY` dated 1970
  * would spin forever.
  *
- * So the budget comes from the series itself: how many steps of its own frequency fit
- * between where it starts and the end of the window, plus slack. Real calendars land far
+ * So the budget comes from the series itself: how many periods of its own frequency fit
+ * between where it starts and the end of the window, times the occurrences each period can
+ * yield, plus slack. Real calendars land far
  * below the ceiling - a weekly meeting running since 2020 needs about 300 - while a
  * frequency fine enough to be abusive exceeds it and is truncated instead of expanded.
  *
@@ -142,9 +143,31 @@ export function expansionIterationBudget(
   const step =
     (EXPANSION_STEP_SECONDS[(freq ? freq[1] : '').toUpperCase()] || EXPANSION_STEP_SECONDS.DAILY) *
     interval;
-  const steps = Math.ceil(Math.max(0, windowEndUnix - seriesStartUnix) / step) + 100;
+  const periods = Math.ceil(Math.max(0, windowEndUnix - seriesStartUnix) / step);
+  const steps = periods * occurrencesPerPeriod(rule) + 100;
   return Math.min(MAX_EXPANSION_ITERATIONS, Math.max(MIN_EXPANSION_ITERATIONS, steps));
 }
+
+/**
+ * An upper bound on how many occurrences one FREQ period of a rule yields. Each BY list can
+ * multiply the count, and a weekday without an ordinal matches every week of a month or year:
+ * `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` takes five steps a week. Lists that only filter the
+ * period, such as BYDAY under DAILY, are counted too; overestimating only raises the cap.
+ */
+function occurrencesPerPeriod(rule: string): number {
+  const freq = ((/FREQ=([A-Z]+)/i.exec(rule) || [])[1] || '').toUpperCase();
+  let count = 1;
+  for (const [, part, values] of rule.matchAll(/(BY[A-Z]+)=([^;]+)/gi)) {
+    const name = part.toUpperCase();
+    if (name === 'BYSETPOS') continue;
+    const matches = (value: string) =>
+      name === 'BYDAY' && !/\d/.test(value) ? WEEKS_PER_PERIOD[freq] || 1 : 1;
+    count *= values.split(',').reduce((sum, value) => sum + matches(value), 0);
+  }
+  return count;
+}
+
+const WEEKS_PER_PERIOD: { [freq: string]: number } = { MONTHLY: 5, YEARLY: 53 };
 
 /**
  * The RRULE of the first VEVENT, ignoring any that belong to a VTIMEZONE.
@@ -1032,8 +1055,8 @@ export function applyEditsToException(
  * series from 1AM to 3AM). Only RECURRENCE-ID shifts so expandBetween can still
  * substitute the exception for the correct (now-shifted) occurrence slot.
  *
- * The master's EXDATEs shift too: they name instants the rule does not occur at, so left
- * behind they would exclude nothing.
+ * The master's EXDATEs, RDATEs and RRULE UNTIL shift too: left behind, an EXDATE excludes
+ * nothing, an RDATE lands at another time of day, and UNTIL drops or adds a last occurrence.
  *
  * The delta is a fixed number of milliseconds, so a move across a DST change leaves the
  * values on the far side of it an hour off, RECURRENCE-IDs and EXDATEs alike.
@@ -1073,17 +1096,20 @@ export function shiftInlineExceptions(ics: string, deltaMs: number): string {
   for (const vevent of vcalendar.getAllSubcomponents('vevent')) {
     const ridProp = vevent.getFirstProperty('recurrence-id');
     if (!ridProp) {
-      const exdateProps = vevent.getAllProperties('exdate');
-      if (exdateProps.length) {
-        for (const exProp of exdateProps) {
-          const values = exProp.getValues() as ICALTime[];
-          const shifted = values
-            .filter((v) => v && typeof v.toJSDate === 'function')
-            .map(shiftTime);
-          if (shifted.length === values.length && shifted.length) {
-            exProp.setValues(shifted);
-          }
+      const dateProps = [...vevent.getAllProperties('exdate'), ...vevent.getAllProperties('rdate')];
+      for (const prop of dateProps) {
+        const values = prop.getValues() as ICALTime[];
+        const shifted = values.filter((v) => v && typeof v.toJSDate === 'function').map(shiftTime);
+        if (shifted.length === values.length && shifted.length) {
+          prop.setValues(shifted);
         }
+      }
+      const rrule = vevent.getFirstPropertyValue('rrule') as ICALRecur | null;
+      if (rrule && rrule.until) {
+        rrule.until = shiftTime(rrule.until);
+        vevent.updatePropertyWithValue('rrule', rrule);
+      }
+      if (dateProps.length || rrule?.until) {
         vevent.updatePropertyWithValue('dtstamp', nowUTC(ical));
       }
       continue;
@@ -1101,9 +1127,38 @@ export function shiftInlineExceptions(ics: string, deltaMs: number): string {
   return root.toString();
 }
 
+/** The instant whose wall clock in `toZone` is the one `ms` reads in the zone `like` is in. */
+function sameWallClockMs(ms: number, like: ICALTime, toZone: string, ical: ICAL): number {
+  const instant = new Date(ms);
+  let wall: ICALTime;
+  if (isNamedZone(like.zone, ical)) {
+    wall = ical.Time.fromJSDate(instant, true).convertToZone(like.zone);
+  } else {
+    wall = ical.Time.fromJSDate(instant, like.zone === ical.Timezone.utcTimezone);
+  }
+  const momentTz = require('moment-timezone');
+  return momentTz
+    .tz(
+      {
+        year: wall.year,
+        month: wall.month - 1,
+        date: wall.day,
+        hour: wall.hour,
+        minute: wall.minute,
+        second: wall.second,
+      },
+      toZone
+    )
+    .valueOf();
+}
+
 /**
  * Updates times for all occurrences of a recurring event.
- * Shifts the entire series by the delta between the original occurrence and new times.
+ * Shifts the entire series by the delta between the original occurrence and new times, and the
+ * RECURRENCE-IDs and EXDATEs of its moved and deleted occurrences as far as the series moved.
+ *
+ * A new `timezone` keeps the series' wall clock, which the occurrence's instant delta misses
+ * when only one of the two zones is on DST at one of the dates.
  *
  * @param ics - The master event's ICS data
  * @param originalOccurrenceStart - The original start time of the dragged occurrence (unix seconds)
@@ -1114,6 +1169,27 @@ export function shiftInlineExceptions(ics: string, deltaMs: number): string {
  * @returns The modified ICS string with shifted series times
  */
 export function updateRecurringEventTimes(
+  ics: string,
+  originalOccurrenceStart: number,
+  newStart: number,
+  newEnd: number,
+  isAllDay: boolean,
+  timezone?: string
+): string {
+  const currentStart = parseICSString(ics).event.startDate.toJSDate().getTime();
+  const moved = moveSeriesMaster(
+    ics,
+    originalOccurrenceStart,
+    newStart,
+    newEnd,
+    isAllDay,
+    timezone
+  );
+  const movedStart = parseICSString(moved).event.startDate.toJSDate().getTime();
+  return shiftInlineExceptions(moved, movedStart - currentStart);
+}
+
+function moveSeriesMaster(
   ics: string,
   originalOccurrenceStart: number,
   newStart: number,
@@ -1148,9 +1224,22 @@ export function updateRecurringEventTimes(
 
   // Shift the master start by the occurrence's move delta, then apply the new duration, so a
   // resize (which changes newEnd relative to newStart) actually changes the whole series.
-  const deltaMs = (newStart - originalOccurrenceStart) * 1000;
   const durationMs = (newEnd - newStart) * 1000;
-  const newMasterStart = currentStart + deltaMs;
+  const toZone = timezone ? resolveIanaZone(timezone) : null;
+  let newMasterStart: number;
+  if (toZone) {
+    const ical = getICAL();
+    const rezonedSlot = sameWallClockMs(
+      originalOccurrenceStart * 1000,
+      event.startDate,
+      toZone,
+      ical
+    );
+    newMasterStart =
+      sameWallClockMs(currentStart, event.startDate, toZone, ical) + newStart * 1000 - rezonedSlot;
+  } else {
+    newMasterStart = currentStart + (newStart - originalOccurrenceStart) * 1000;
+  }
   return updateEventTimes(ics, {
     start: newMasterStart / 1000,
     end: (newMasterStart + durationMs) / 1000,
@@ -1943,6 +2032,7 @@ export function expandBetween(
         .flatMap((prop) => prop.getValues() as ICALTime[])
         .map((time) => time.toJSDate().getTime())
     );
+    const skipBefore = skippableBefore(event, exceptions, after);
     const iterator = event.iterator();
     for (let i = 0; i < maxIterations; i++) {
       const next = iterator.next();
@@ -1951,6 +2041,7 @@ export function expandBetween(
       // not the rule's. Stopping on the moved start alone would end the series at the first
       // occurrence moved past the window.
       const instant = next.toJSDate().getTime();
+      if (instant < skipBefore) continue;
       const occurrence = event.getOccurrenceDetails(next);
       const occurrenceSpan = span(occurrence);
       if (instant > before && occurrenceSpan.from > before) break;
@@ -1968,6 +2059,27 @@ export function expandBetween(
     }
   }
   return [...shownAsThemselves, ...occurrences];
+}
+
+const DAY_MS = 86400 * 1000;
+
+/**
+ * The instant (ms) before which a series' rule slots can be stepped past without reading their
+ * occurrence details. Those details convert zones and cost most of an expansion, and a series
+ * that began years ago steps through every slot since. A slot ends before the window when it
+ * starts a duration before it, give or take a day for a DST change inside the duration.
+ *
+ * An exception draws its slot at its own times, so one that reaches the window stops skipping
+ * from its slot onwards. One that ends before the window can't put its slot in it, and series
+ * usually carry those from their first weeks. A THISANDFUTURE exception shifts every later slot,
+ * so it stops skipping wherever it ends.
+ */
+function skippableBefore(series: ICALEvent, exceptions: ICALEvent[], windowStart: number) {
+  const duration = series.endDate.toJSDate().getTime() - series.startDate.toJSDate().getTime();
+  const exceptionSlots = exceptions
+    .filter((ex) => ex.modifiesFuture() || ex.endDate.toJSDate().getTime() >= windowStart)
+    .map((ex) => ex.recurrenceId.toJSDate().getTime());
+  return Math.min(windowStart - Math.max(0, duration), ...exceptionSlots) - DAY_MS;
 }
 
 export interface Occurrence {

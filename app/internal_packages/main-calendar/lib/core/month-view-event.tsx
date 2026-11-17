@@ -1,14 +1,16 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
 import classnames from 'classnames';
-import { localized, isRTL } from 'mailspring-exports';
+import { isRTL } from 'mailspring-exports';
+import { withSmallMeridiem } from 'mailspring-component-kit';
 import {
   EventOccurrence,
+  isOffCalendar,
   isTimed,
   occurrenceStartUnix,
   occurrenceEndUnix,
 } from './calendar-data-source';
-import { calcEventColors, formatShortTime } from './calendar-helpers';
+import { BarEndTime, BarStartTime, calcEventColors, formatEventTooltip } from './calendar-helpers';
 import { HitZone } from './calendar-drag-types';
 import { detectHitZone, canAttemptMove, formatDragPreviewTime } from './calendar-drag-utils';
 
@@ -104,6 +106,17 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
     onFocused(event);
   }
 
+  // See CalendarEvent._pressing.
+  _pressing = false;
+
+  _onFocus = () => {
+    if (!this._pressing && !this.props.selected) this.props.onFocused(this.props.event);
+  };
+
+  _onBlur = () => {
+    this._pressing = false;
+  };
+
   _onClick = (e: React.MouseEvent<HTMLDivElement>) => {
     e.stopPropagation();
     this.props.onClick(e, this.props.event);
@@ -178,6 +191,7 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
    * Initiate drag on mouse down
    */
   _onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    this._pressing = true;
     if (!this._canDrag() || !this.state.hitZone) {
       return;
     }
@@ -213,13 +227,11 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
     return 'default';
   }
 
-  // One-day timed chips go bare, as in Apple and Notion Calendar; all-day chips and anything
-  // spanning days keep the tint so they read as a bar. Selection fills either through CSS.
+  // One-day timed chips go bare; all-day chips and anything spanning days keep the tint so they
+  // read as a bar. Selection fills either through CSS.
   _backgroundColor(tint: string) {
     const { event } = this.props;
-    if (event.isPending) {
-      return 'rgba(128, 128, 128, 0.15)';
-    }
+    if (event.isAwaitingMyResponse) return 'transparent';
     return event.isAllDay || spansDays(event) ? tint : 'transparent';
   }
 
@@ -230,7 +242,9 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
     const className = classnames('month-view-event', {
       selected: selected,
       'is-all-day': event.isAllDay,
+      cancelled: isOffCalendar(event),
       pending: event.isPending,
+      'awaiting-response': event.isAwaitingMyResponse && !isOffCalendar(event),
       dragging: isDragging,
       draggable: this._canDrag(),
       'drag-preview': event.isDragPreview,
@@ -260,7 +274,7 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
       return (
         <div className={className} style={style}>
           <span className="month-view-event-title">{event.title}</span>
-          <span className="drag-preview-time-tooltip">{timeString}</span>
+          <span className="drag-preview-time-tooltip">{withSmallMeridiem(timeString)}</span>
         </div>
       );
     }
@@ -270,25 +284,22 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
         id={this.props.isFirstBar ? event.id : undefined}
         className={className}
         style={style}
+        title={formatEventTooltip(event)}
         onClick={this._onClick}
         onDoubleClick={this._onDoubleClick}
         onContextMenu={this._onContextMenu}
         onMouseMove={this._onMouseMove}
         onMouseLeave={this._onMouseLeave}
         onMouseDown={this._onMouseDown}
+        onFocus={this._onFocus}
+        onBlur={this._onBlur}
         tabIndex={this.props.isFirstBar ? 0 : -1}
       >
         <span className="month-view-event-title">
-          {!continuesBefore && isTimed(event) && (
-            <span className="month-view-event-time">{formatShortTime(event.start)} </span>
-          )}
-          {event.title}
+          {!continuesBefore && isTimed(event) && <BarStartTime event={event} />}
+          {isOffCalendar(event) ? <s>{event.title}</s> : event.title}
         </span>
-        {!continuesAfter && isTimed(event) && spansDays(event) && (
-          <span className="month-view-event-end-time">
-            {localized('ends %@', formatShortTime(event.end))}
-          </span>
-        )}
+        {!continuesAfter && isTimed(event) && spansDays(event) && <BarEndTime event={event} />}
       </div>
     );
   }
