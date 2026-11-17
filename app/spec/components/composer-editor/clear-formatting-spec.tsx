@@ -70,11 +70,11 @@ describe('Local composer fixes', () => {
     editor.moveTo(editor.value.document.getFirstText().key as any, 3);
     clearTextFormatting(editor);
     editor.insertText('X');
-    const inserted = editor.value.document
-      .getFirstText()
-      .leaves.find((leaf) => leaf.text.includes('X'));
-    expect(inserted.marks.size).toBe(1);
-    expect(inserted.marks.first().type).toBe('link');
+    editor.moveAnchorBackward(1);
+    const marks = editor.value.marks;
+    expect(editor.value.document.text).toBe('redX link blue');
+    expect(marks.size).toBe(1);
+    expect(marks.first().type).toBe('link');
   });
 
   it('keeps undo and shifted redo inside Slate, including nested targets', () => {
